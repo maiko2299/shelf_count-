@@ -11,8 +11,14 @@ const Matcher = (() => {
   const ALIKE = [['A','8'],['O','0'],['I','1'],['L','1'],['S','5'],['B','8'],['Z','2'],['G','6'],['T','7'],['Q','0'],['D','0']];
   const alikeSet = new Set(ALIKE.flatMap(([a,b]) => [a+b, b+a]));
 
-  const SYN = {sw:'switch',sws:'switch',xdcr:'transducer',xducer:'transducer',xmtr:'transmitter',vlv:'valve',vavle:'valve',reg:'regulator',regs:'regulator',psig:'psi',psgi:'psi',psid:'psi',assy:'assembly',elem:'element',comm:'communication',communications:'communication',temp:'temperature',thermo:'thermowell',touchscreen:'touchscreen',hmi:'hmi',xfmr:'transformer',ctrl:'controller',controllr:'controller',con:'controller',sol:'solenoid',filters:'filter',valves:'valve',kits:'kit',boards:'board',sensors:'sensor',gauges:'gauge',meters:'meter',motors:'motor',screens:'screen',relays:'relay',lesser:'leser',laser:'leser',lochinvar:'lochinvar',lock:'lock'};
+  const SYN = {sw:'switch',sws:'switch',xdcr:'transducer',xducer:'transducer',xmtr:'transmitter',vlv:'valve',vavle:'valve',reg:'regulator',regs:'regulator',psig:'psi',psgi:'psi',psid:'psi',assy:'assembly',elem:'element',comm:'communication',communications:'communication',temp:'temperature',thermo:'thermowell',touchscreen:'touchscreen',hmi:'hmi',xfmr:'transformer',ctrl:'controller',controllr:'controller',con:'controller',sol:'solenoid',filters:'filter',valves:'valve',kits:'kit',boards:'board',sensors:'sensor',gauges:'gauge',meters:'meter',motors:'motor',screens:'screen',relays:'relay',lesser:'leser',rlf:'relief',rel:'relief',prv:'relief',chk:'check',laser:'leser',lochinvar:'lochinvar',lock:'lock'};
   const syn = w => SYN[w] || w;
+  // sizes and ratings are specs, not quantities: 2" / 2 inch -> 2in, 100 psig / 5000# -> 100psi
+  const FRAC = { '1/2': .5, '1/4': .25, '3/4': .75, '1/8': .125, '3/8': .375, '5/8': .625, '7/8': .875 };
+  const specs = t => String(t)
+    .replace(/(\d+)(?:\s+|-)(\d\/\d)(?=\s*(?:"|”|''|-?inch|in\b))/gi, (m, w, f) => FRAC[f] != null ? String(+w + FRAC[f]) : m)
+    .replace(/(\d+(?:\.\d+)?(?:\s*\/\s*\d+)?)\s*(?:"|”|''|-?inch(?:es)?\b|in\.?(?=\s|$|[,)]))/gi, (m, n) => n.replace(/\s+/g, '') + 'in ')
+    .replace(/(\d+)\s*(?:psig|psgi|psid|psi|pounds?|lbs?|#)(?=[^a-z]|$)/gi, '$1psi ');
   const alnum = s => String(s).toUpperCase().replace(/[^A-Z0-9]/g,'');
 
   function wordsToDigits(text) {
@@ -21,7 +27,8 @@ const Matcher = (() => {
       .replace(/\b(dash|hyphen|minus)\b/g,'-')
       .replace(/\b(point|dot)\b/g,'.')
       .replace(/\bslash\b/g,'/')
-      .replace(/\bthree[ -]quarters?( of an?)?\b/g,'3/4').replace(/\b(one[ -])?half( an?)?(?= inch| hp| horse)/g,'1/2').replace(/\bquarter( inch)\b/g,'1/4$1')
+      .replace(/\band (a|one) half\b/g,' and-a-half').replace(/\band (a|one) quarter\b/g,' and-a-quarter').replace(/\band three quarters?\b/g,' and-three-quarters')
+      .replace(/\bthree[ -]quarters?( of an?)?\b/g,'3/4').replace(/(?<!-)\b(one[ -])?half( an?)?(?= inch| hp| horse)/g,'1/2').replace(/\bquarter( inch)\b/g,'1/4$1')
       .replace(/\bhorse ?power\b/g,'hp').replace(/\ballen[ -]?bradley\b/g,'ab').replace(/\binches\b/g,'inch')
       .replace(/\bdouble (\w+)/g,'$1 $1')
       .replace(/\btriple (\w+)/g,'$1 $1 $1') + ' ';
@@ -31,8 +38,9 @@ const Matcher = (() => {
     t = t.replace(/\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)\b/g,m=>String(TENS[m]));
     t = t.replace(/\b(zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen)\b/g,m=>String(ONES[m]));
     // "oh" between digits -> 0
+    t = t.replace(/(\d+)\s+and-a-half\b/g,(m,n)=>String(+n+.5)).replace(/(\d+)\s+and-a-quarter\b/g,(m,n)=>String(+n+.25)).replace(/(\d+)\s+and-three-quarters\b/g,(m,n)=>String(+n+.75));
     t = t.replace(/(\d)\s+oh\b/g,'$1 0').replace(/\boh\s+(\d)/g,'0 $1');
-    return t.replace(/\s+/g,' ').trim();
+    return specs(t).replace(/\s+/g,' ').trim();
   }
 
   function lev(a, b, weighted) {
@@ -63,7 +71,7 @@ const Matcher = (() => {
       const norm = alnum(p.id);
       const segs = String(p.id).toUpperCase().split(/[^A-Z0-9]+/).filter(s=>s.length>=2);
       const dw = new Map();
-      for (const [src, wt] of [[p.type, 0.8], [p.desc, 1]]) for (const w of tokenizeWords(src)) {
+      for (const [src, wt] of [[p.type, 0.8], [specs(p.desc), 1]]) for (const w of tokenizeWords(src)) {
         const ww = syn(w.replace(/[.\-]/g,''));
         if (ww.length >= 2 && !STOP.has(ww)) dw.set(ww, Math.max(dw.get(ww)||0, wt));
       }

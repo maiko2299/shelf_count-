@@ -9,8 +9,15 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { return false; } },
   del(k) { try { localStorage.removeItem(k); } catch {} }
 };
-function splitLoc(loc) { const seg = String(loc || '').split(/[\\/]/).map(x => x.trim()).filter(Boolean); return { rack: (seg[0] || '(no rack)').toUpperCase(), bin: (seg[1] || '?').toUpperCase() }; }
-function prepRows(rows) { return rows.map(r => ({ ...r, ...splitLoc(r.loc) })); }
+function splitLoc(loc, fallback) {
+  const seg = String(loc || '').split(/[\\/]/).map(x => x.trim()).filter(Boolean);
+  if (!seg.length) return { rack: String(fallback || 'No bin').trim() || 'No bin', bin: '', noBin: true };
+  return { rack: seg[0].toUpperCase(), bin: (seg[1] || '').toUpperCase(), noBin: false };
+}
+function prepRows(rows, fallback) { return rows.map(r => ({ ...r, ...splitLoc(r.loc, r.wh || fallback) })); }
+const binLabel = b => b ? b : 'All items';
+const binId = b => 'bin-' + (b || '_');
+const hasShelves = () => S && S.parts.some(p => p.bin);
 
 let WH = store.get(WHKEY) || { name: BUILTIN_WH.name, file: 'built-in sample', loadedAt: null, rows: prepRows(BUILTIN_WH.rows), pin: null, builtin: true };
 let S = null, index = null, whIndex = null, whOthers = [];
@@ -45,7 +52,8 @@ function renderSetup() {
   $('whBox').innerHTML = `<b>${esc(WH.name)}</b><span>${WH.rows.length} lines on ${rk.length} racks · ${WH.builtin ? 'sample list: CI5 and CI8 only. Upload the full warehouse export to count other racks.' : `from ${esc(WH.file)}, loaded ${new Date(WH.loadedAt).toLocaleDateString()}`}</span>`;
   $('upLbl').textContent = WH.builtin ? 'Upload whole-warehouse export (.xlsx)' : 'Replace with a newer export';
   if (!pickedRack || !rk.some(([r]) => r === pickedRack)) pickedRack = rk.some(([r]) => r === 'CI8') ? 'CI8' : (rk[0] || [null])[0];
-  $('rackGrid').innerHTML = rk.map(([r, n]) => `<button class="rackbtn ${r === pickedRack ? 'sel' : ''}" data-r="${esc(r)}" aria-pressed="${r === pickedRack}"><b>${esc(r)}</b><span>${n} lines</span></button>`).join('');
+  const noBinRacks = new Set(WH.rows.filter(x => x.noBin).map(x => x.rack));
+  $('rackGrid').innerHTML = rk.map(([r, n]) => `<button class="rackbtn ${r === pickedRack ? 'sel' : ''} ${r.length > 7 ? 'long' : ''}" data-r="${esc(r)}" aria-pressed="${r === pickedRack}"><b>${esc(r)}</b><span>${n} lines${noBinRacks.has(r) ? ' · no bins' : ''}</span></button>`).join('');
 }
 $('rackGrid').addEventListener('click', e => { const b = e.target.closest('.rackbtn'); if (!b) return; pickedRack = b.dataset.r; renderSetup(); });
 $('startBtn').addEventListener('click', () => {
@@ -74,17 +82,17 @@ $('inFile').addEventListener('change', async e => {
       if (hi < 0) continue;
       const H = aoa[hi].map(c => String(c || '').trim().toLowerCase());
       const col = (...names) => H.findIndex(h => names.includes(h));
-      const ci = { id: col('part id'), type: col('part type','type'), desc: col('description'), status: col('status'), loc: col('bin location','warehouse bin','location','bin'), avail: col('available'), onHand: col('on hand','onhand','qty on hand'), cost: col('current cost','cost','unit cost') };
-      if (ci.loc < 0) throw new Error('No "Bin Location" column, so racks can\'t be told apart');
+      const ci = { id: col('part id'), type: col('part type','type'), desc: col('description'), status: col('status'), loc: col('bin location','warehouse bin','bin','bin #','bin number','location'), wh: col('warehouse','inventory warehouse','warehouse name','warehouse id'), avail: col('available'), onHand: col('on hand','onhand','qty on hand'), cost: col('current cost','cost','unit cost') };
       for (const r of aoa.slice(hi + 1)) {
         const id = r[ci.id]; if (id == null || String(id).trim() === '') continue;
         if (/^count:/i.test(String(id))) continue;
         const cost = ci.cost >= 0 ? parseFloat(String(r[ci.cost] ?? '0').replace(/[$,]/g, '')) || 0 : 0;
-        rows.push({ id: String(id).trim(), type: r[ci.type] || '', desc: r[ci.desc] || '', status: r[ci.status] || '', loc: r[ci.loc] || '', avail: +r[ci.avail] || 0, onHand: +r[ci.onHand] || 0, cost });
+        rows.push({ id: String(id).trim(), type: r[ci.type] || '', desc: r[ci.desc] || '', status: r[ci.status] || '', loc: ci.loc >= 0 ? String(r[ci.loc] ?? '').trim() : '', wh: ci.wh >= 0 ? String(r[ci.wh] ?? '').trim() : '', avail: +r[ci.avail] || 0, onHand: +r[ci.onHand] || 0, cost });
       }
     }
     if (!rows.length) throw new Error('No sheet with a "Part ID" header and part rows');
-    WH = { name: f.name.replace(/\.(xlsx|xls|csv)$/i, ''), file: f.name, loadedAt: new Date().toISOString(), rows: prepRows(rows), pin: WH.pin, builtin: false };
+    const whName = f.name.replace(/\.(xlsx|xls|csv)$/i, '');
+    WH = { name: whName, file: f.name, loadedAt: new Date().toISOString(), rows: prepRows(rows, whName), pin: WH.pin, builtin: false };
     const ok = store.set(WHKEY, WH);
     $('fileMsg').textContent = `Loaded ${rows.length} lines.${ok ? '' : ' (Too big to keep on this phone; re-upload if you close the page.)'}`;
     pickedRack = null; renderSetup();
@@ -103,18 +111,20 @@ function renderHeader() {
   $('hShelf').textContent = S.rack;
   $('hMeta').innerHTML = `${esc(S.counter)} · <span class="num">${c}/${n}</span> lines${S.pending.length ? ` · <b style="color:var(--warn)">${S.pending.length} to confirm</b>` : ''}`;
   $('hBar').style.width = (n ? c / n * 100 : 0) + '%';
-  $('hBins').innerHTML = binsInOrder().map(b => {
+  $('hBins').hidden = !hasShelves();
+  $('hBins').innerHTML = !hasShelves() ? '' : binsInOrder().filter(b => b).map(b => {
     const ps = S.parts.filter(p => p.bin === b); const done = ps.every(p => S.counts[p._i] != null);
     return `<button class="binchip ${S.bin === b ? 'on' : ''} ${done ? 'done' : ''}" data-b="${b}" aria-pressed="${S.bin === b}" aria-label="Shelf ${b}">${b}</button>`;
   }).join('');
-  $('binHint').textContent = S.bin ? `Shelf ${S.bin}: new lines log here` : 'Shelf: none set. Say “shelf A”';
+  $('binHint').textContent = !hasShelves() ? 'No bins here. Just say part and count.' : S.bin ? `Shelf ${S.bin}: new lines log here` : 'Shelf: none set. Say “shelf A”';
 }
 function renderBins() {
   S.parts.forEach((p, i) => p._i = i);
   $('binsList').innerHTML = binsInOrder().map(b => {
     const ps = S.parts.filter(p => p.bin === b);
     const c = ps.filter(p => S.counts[p._i] != null).length;
-    return `<div class="bin" id="bin-${b}"><div class="binhead"><span class="tag"><small>\\${esc(S.rack)}\\</small>${b}</span><span class="cnt num">${c}/${ps.length} counted</span></div>
+    const tag = b ? `<span class="tag"><small>\\${esc(S.rack)}\\</small>${b}</span>` : `<span class="tag">${esc(S.rack)}<small>${hasShelves() ? '· no bin' : ''}</small></span>`;
+    return `<div class="bin" id="${binId(b)}"><div class="binhead">${tag}<span class="cnt num">${c}/${ps.length} counted</span></div>
       <div class="rows">${ps.map(rowHTML).join('')}</div></div>`;
   }).join('') + (S.strays.length ? `<div class="bin"><div class="binhead"><span class="tag" style="background:var(--warn-bg);color:var(--warn)">From other racks</span><span class="cnt">system says these live elsewhere</span></div>
       <div class="rows">${S.strays.map(strayHTML).join('')}</div></div>` : '');
@@ -131,7 +141,7 @@ function rowHTML(p) {
 }
 function strayHTML(st) {
   return `<div class="row counted" data-sid="${st.id}"><div class="stripe" style="background:var(--warn)"></div>
-    <div class="info"><div class="stray">System location ${esc(st.part.loc)}</div><div class="pn">${esc(st.part.id)}</div><div class="desc">${esc(st.part.desc)}</div><div class="notes">${esc(st.notes.join(' · '))}</div></div>
+    <div class="info"><div class="stray">System location ${esc(st.part.loc || st.part.rack + ' (no bin)')}</div><div class="pn">${esc(st.part.id)}</div><div class="desc">${esc(st.part.desc)}</div><div class="notes">${esc(st.notes.join(' · '))}</div></div>
     <div class="stepper"><button data-sact="dec" aria-label="Minus one">−</button><div class="val num">${st.qty}</div><button data-sact="inc" aria-label="Plus one">+</button></div></div>`;
 }
 function renderPending() {
@@ -140,9 +150,9 @@ function renderPending() {
 function pcardHTML(pd) {
   const unknown = pd.status === 'unknown';
   const elsewhere = pd.top.some(t => t.key[0] === 'w');
-  const why = pd.status === 'needqty' ? 'Part found. How many?' : unknown ? (elsewhere ? `Not on ${esc(S.rack)}'s list. These match elsewhere in the warehouse:` : 'No match anywhere in the warehouse list. Log it as not in system.') : 'More than one part fits. Tap the right one.';
+  const why = pd.status === 'needqty' ? 'Part found. How many?' : (!unknown && pd.top.length === 1) ? 'Best guess. Tap it to confirm.' : unknown ? (elsewhere ? `Not on ${esc(S.rack)}'s list. These match elsewhere in the warehouse:` : 'No match anywhere in the warehouse list. Log it as not in system.') : 'More than one part fits. Tap the right one.';
   const choices = pd.top.map(t => { const p = partByKey(t.key); const other = t.key[0] === 'w';
-    return `<button class="choice ${pd.sel === t.key ? 'sel' : ''}" data-pick="${t.key}"><b>${esc(p.id)}</b><span>${other ? `<strong style="color:var(--warn)">${esc(p.loc)}</strong> · ` : ''}${esc(p.desc)}${other ? '' : ' · shelf ' + p.bin}</span><em class="pct num">${Math.round(Math.min(1, t.score) * 100)}%</em></button>`; }).join('');
+    return `<button class="choice ${pd.sel === t.key ? 'sel' : ''}" data-pick="${t.key}"><b>${esc(p.id)}</b><span>${other ? `<strong style="color:var(--warn)">${esc(p.loc || p.rack)}</strong> · ` : ''}${esc(p.desc)}${other || !p.bin ? '' : ' · shelf ' + p.bin}</span><em class="pct num">${Math.round(Math.min(1, t.score) * 100)}%</em></button>`; }).join('');
   return `<div class="pcard ${unknown ? 'unknown' : ''}" data-pid="${pd.id}">
     <div class="heard">Heard <q>${esc(pd.raw)}</q>${pd.bin ? ` <span class="tag" style="font-size:13px;padding:1px 6px">${pd.bin}</span>` : ''}</div>
     <div class="why">${why}</div>
@@ -173,7 +183,8 @@ function applyCount(i, qty, opts = {}) {
   if (opts.raw) c.heard.push(opts.raw);
   if (opts.countedAs) addNote(c, `Counted as ${opts.countedAs}`);
   if (opts.byDesc) addNote(c, 'Matched by description');
-  if (opts.bin && opts.bin !== p.bin) addNote(c, `Found on shelf ${opts.bin}, system shows ${p.bin} - relocate/update bin`);
+  if (opts.bin && p.bin && opts.bin !== p.bin) addNote(c, `Found on shelf ${opts.bin}, system shows ${p.bin} - relocate/update bin`);
+  if (opts.bin && !p.bin && hasShelves()) addNote(c, `Found on shelf ${opts.bin}, no bin in system - assign bin`);
   if (qty === 0 && opts.notFound) addNote(c, 'Not found in count - verify');
   logIt({ ...opts, part: p.id, qty });
   undoStack.push({ type: 'count', i, prev, logLen: S.log.length - 1 });
@@ -185,7 +196,8 @@ function applyStray(wi, qty, opts = {}) {
   const prevStrays = JSON.parse(JSON.stringify(S.strays));
   if (!st) { st = { id: 's' + (S.seq++), part: { ...p }, qty: 0, notes: [], parts: [] }; S.strays.push(st); }
   st.parts.push(qty); st.qty += qty;
-  addNote(st, `Found on \\${S.rack}\\${opts.bin || '?'}, system shows ${p.loc} - relocate/update bin`);
+  const here = opts.bin ? `\\${S.rack}\\${opts.bin}` : S.rack, there = p.loc || `${p.rack} (no bin)`;
+  addNote(st, `Found on ${here}, system shows ${there} - relocate/update bin`);
   if (st.parts.length > 1) { st.notes = st.notes.filter(n => !/^Logged as /.test(n)); addNote(st, `Logged as ${st.parts.join(' + ')}`); }
   logIt({ ...opts, part: p.id + ' (system ' + p.loc + ')', qty, status: 'stray' });
   undoStack.push({ type: 'strays', prev: prevStrays, logLen: S.log.length - 1 });
@@ -245,7 +257,7 @@ function commitOne(raw) {
 }
 function spokenPN(p) { return (String(p.id).split(/[\s\-]/)[0] || p.id).slice(0, 8); }
 function flashRow(i) { buzz(25); requestAnimationFrame(() => { const el = $('row-' + i); if (el) { el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash'); } }); }
-function scrollToBin(b) { requestAnimationFrame(() => { const el = $('bin-' + b); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }); }
+function scrollToBin(b) { requestAnimationFrame(() => { const el = $(binId(b)); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }); }
 function buzz(p) { try { navigator.vibrate && navigator.vibrate(p); } catch {} }
 
 /* live preview */
@@ -255,7 +267,7 @@ function updatePreview() {
   const text = $('say').value; const pv = $('preview');
   const utts = Matcher.splitUtterances(text);
   pv.className = 'preview';
-  if (!utts.length) { $('ptxt').textContent = S.bin ? `On shelf ${S.bin}. Say a part and a count.` : 'Tap the box, then the keyboard mic. Say “shelf A” to start.'; return; }
+  if (!utts.length) { $('ptxt').textContent = !hasShelves() ? 'Tap the box, then the keyboard mic. Say a part and a count.' : S.bin ? `On shelf ${S.bin}. Say a part and a count.` : 'Tap the box, then the keyboard mic. Say “shelf A” to start.'; return; }
   const r = Matcher.parse(utts[utts.length - 1], index, { bin: S.bin });
   if (!r) return;
   const more = utts.length > 1 ? `<span style="color:var(--muted)">${utts.length} lines · </span>` : '';
@@ -283,7 +295,7 @@ $('binsList').addEventListener('click', e => {
     if (st.qty === 0) S.strays = S.strays.filter(x => x !== st); save(); renderAll(); return; }
   const row = e.target.closest('.row'); if (!row) return;
   const i = +row.dataset.i; const act = e.target.closest('[data-act]')?.dataset.act;
-  if (act === 'inc') { const c = S.counts[i]; applyCount(i, (c ? c.qty : 0) + 1, { mode: 'set', bin: S.bin && S.bin !== S.parts[i].bin ? S.bin : null }); renderAll(); return; }
+  if (act === 'inc') { const c = S.counts[i]; applyCount(i, (c ? c.qty : 0) + 1, { mode: 'set', bin: S.bin && S.parts[i].bin && S.bin !== S.parts[i].bin ? S.bin : null }); renderAll(); return; }
   if (act === 'dec') { const c = S.counts[i]; applyCount(i, Math.max(0, (c ? c.qty : 1) - 1), { mode: 'set' }); renderAll(); return; }
   if (act === 'zero') { applyCount(i, 0, { mode: 'set', notFound: true }); renderAll(); return; }
   if (act === 'clear') { undoStack.push({ type: 'count', i, prev: S.counts[i] ? JSON.parse(JSON.stringify(S.counts[i])) : null, logLen: S.log.length }); delete S.counts[i]; save(); renderAll(); return; }
@@ -391,7 +403,7 @@ function showReview() {
       <div class="stat"><small>Not in system</small><b class="num">${S.unlisted.length}</b></div>
     </div>
     ${unc.length ? `<h2>Not counted yet (${unc.length})</h2><p>These go in the file as 0, "Not found in count - verify". Go back if you skipped a shelf.</p>
-      <div class="tablewrap"><table style="min-width:0"><thead><tr><th>Shelf</th><th>Part ID</th><th>Description</th></tr></thead><tbody>${unc.map(r => `<tr><td>${r.p.bin}</td><td class="mono">${esc(r.p.id)}</td><td>${esc(r.p.desc)}</td></tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--ok);font-weight:600">Every line on this rack has a count.</p>'}
+      <div class="tablewrap"><table style="min-width:0"><thead><tr><th>Shelf</th><th>Part ID</th><th>Description</th></tr></thead><tbody>${unc.map(r => `<tr><td>${r.p.bin || '–'}</td><td class="mono">${esc(r.p.id)}</td><td>${esc(r.p.desc)}</td></tr>`).join('')}</tbody></table></div>` : '<p style="color:var(--ok);font-weight:600">Every line on this rack has a count.</p>'}
     <div class="prow"><button class="btn primary" id="blindBtn">Save count file</button><button class="btn" id="csvBtn">Save CSV</button>${S.unlisted.some(u => u.photo) ? '<button class="btn" id="photoBtn">Save photos</button>' : ''}</div>
     <div class="empty-note" id="saveMsg"></div>
     <div id="mgr" style="display:grid;gap:14px;border-top:1px solid var(--line);padding-top:14px"></div>
@@ -431,9 +443,9 @@ function renderManager() {
       <div class="stat"><small>Net variance</small><b class="num">${money(over + under)}</b></div>
     </div>
     ${varRows.length ? `<div class="tablewrap"><table><thead><tr><th>Part ID</th><th>Shelf</th><th class="r">System</th><th class="r">Counted</th><th class="r">Var</th><th class="r">Var $</th><th>Notes</th></tr></thead><tbody>
-      ${varRows.map(r => `<tr class="${r.vq > 0 ? 'over' : 'under'}"><td class="mono">${esc(r.p.id)}</td><td>${r.p.bin}</td><td class="r num">${r.p.onHand}</td><td class="r num">${r.counted}</td><td class="r num v">${r.vq > 0 ? '+' : ''}${r.vq}</td><td class="r num v">${money(r.vd)}</td><td>${esc(r.notes)}</td></tr>`).join('')}
+      ${varRows.map(r => `<tr class="${r.vq > 0 ? 'over' : 'under'}"><td class="mono">${esc(r.p.id)}</td><td>${r.p.bin || '–'}</td><td class="r num">${r.p.onHand}</td><td class="r num">${r.counted}</td><td class="r num v">${r.vq > 0 ? '+' : ''}${r.vq}</td><td class="r num v">${money(r.vd)}</td><td>${esc(r.notes)}</td></tr>`).join('')}
     </tbody></table></div>` : '<p>Every line matched the system.</p>'}
-    ${S.strays.length ? `<h2>Found here, system says elsewhere</h2><div class="tablewrap"><table><thead><tr><th>Part ID</th><th>System location</th><th class="r">System on hand</th><th class="r">Found here</th><th>Notes</th></tr></thead><tbody>${S.strays.map(s => `<tr><td class="mono">${esc(s.part.id)}</td><td>${esc(s.part.loc)}</td><td class="r num">${s.part.onHand}</td><td class="r num">${s.qty}</td><td>${esc(s.notes.join('; '))}</td></tr>`).join('')}</tbody></table></div>` : ''}
+    ${S.strays.length ? `<h2>Found here, system says elsewhere</h2><div class="tablewrap"><table><thead><tr><th>Part ID</th><th>System location</th><th class="r">System on hand</th><th class="r">Found here</th><th>Notes</th></tr></thead><tbody>${S.strays.map(s => `<tr><td class="mono">${esc(s.part.id)}</td><td>${esc(s.part.loc || s.part.rack + ' (no bin)')}</td><td class="r num">${s.part.onHand}</td><td class="r num">${s.qty}</td><td>${esc(s.notes.join('; '))}</td></tr>`).join('')}</tbody></table></div>` : ''}
     ${S.unlisted.length ? `<h2>On the rack, not in system</h2><div class="tablewrap"><table><thead><tr><th>Part # (as counted)</th><th>Shelf</th><th>Description</th><th class="r">Qty</th><th>Notes</th></tr></thead><tbody>${S.unlisted.map(u => `<tr><td class="mono">${esc(u.pn)}</td><td>${esc(u.bin)}</td><td>${esc(u.desc)}</td><td class="r num">${u.qty}</td><td>${esc(u.notes)}</td></tr>`).join('')}</tbody></table></div>` : ''}
     <div class="prow"><button class="btn primary" id="xlsxBtn">Save variance workbook</button></div>
     <div class="empty-note" id="saveMsg2"></div>`;
@@ -473,8 +485,8 @@ function buildXlsx(withVariance) {
     R++; set(R, 0, str('Found on this rack, system location elsewhere (relocate or update bin)')); R++;
     const hs = withVariance ? ['Part ID','Description','System Bin','Found On','System On Hand','Physical Count','Notes'] : ['Part ID','Description','System Bin','Found On','Physical Count','Notes'];
     hs.forEach((h, c) => set(R, c, str(h))); R++;
-    for (const s of S.strays) { const found = (s.notes.find(n => /^Found on /.test(n)) || '').replace(/^Found on (\S+),.*$/, '$1');
-      const vals = withVariance ? [str(s.part.id), str(s.part.desc), str(s.part.loc), str(found), num(s.part.onHand), num(s.qty), str(s.notes.join('; '))] : [str(s.part.id), str(s.part.desc), str(s.part.loc), str(found), num(s.qty), str(s.notes.join('; '))];
+    for (const s of S.strays) { const found = (s.notes.find(n => /^Found on /.test(n)) || '').replace(/^Found on (.+?), system shows.*$/, '$1');
+      const vals = withVariance ? [str(s.part.id), str(s.part.desc), str(s.part.loc || s.part.rack + ' (no bin)'), str(found), num(s.part.onHand), num(s.qty), str(s.notes.join('; '))] : [str(s.part.id), str(s.part.desc), str(s.part.loc || s.part.rack + ' (no bin)'), str(found), num(s.qty), str(s.notes.join('; '))];
       vals.forEach((v, c) => set(R, c, v)); R++; }
   }
   if (S.unlisted.length) {

@@ -23,6 +23,15 @@ It's a static site with no build step. Vercel serves it as-is (Framework preset:
    - **Save count file** is the blind export (counts only).
    - **Manager view** (PIN) shows variance and saves the CI5-format workbook with live formulas.
 
+## Locations without bins
+
+Service warehouses and vans often have no bin, and ManagerPlus leaves `Bin Location` blank. That's fine:
+
+- The export doesn't need a `Bin Location` column at all.
+- Parts with no bin are grouped under the warehouse name. That comes from a `Warehouse` column if the export has one, otherwise from the file name (e.g. `Service Van 15.xlsx`).
+- With no bins there are no shelf chips. Just say part and count.
+- Sizes and ratings are specs, not quantities: "Habonim 2 inch kit one" logs 1, and "2 and a half inch" or "100 psi" never become counts.
+
 ## Voice
 
 - iPhone: tap the box, then the keyboard mic.
