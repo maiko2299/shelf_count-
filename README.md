@@ -16,7 +16,7 @@ It's a static site with no build step. Vercel serves it as-is (Framework preset:
 
 ## Using it
 
-1. Export the whole warehouse from ManagerPlus as .xlsx. It needs `Part ID`, `Description`, `Bin Location`, `On Hand` and `Current Cost` columns.
+1. Export the whole warehouse from ManagerPlus as .xlsx. It needs `Part ID`, `Description`, `On Hand` and `Current Cost` columns, plus `Bin Location` where the location has bins.
 2. Open the app, upload the export, and pick a rack. The list stays on that phone only and is never sent anywhere.
 3. Count. Yellow cards need one tap; red cards are parts that aren't on that rack.
 4. Finish:
