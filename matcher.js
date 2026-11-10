@@ -13,11 +13,13 @@ const Matcher = (() => {
 
   const SYN = {sw:'switch',sws:'switch',xdcr:'transducer',xducer:'transducer',xmtr:'transmitter',vlv:'valve',vavle:'valve',reg:'regulator',regs:'regulator',psig:'psi',psgi:'psi',psid:'psi',assy:'assembly',elem:'element',comm:'communication',communications:'communication',temp:'temperature',thermo:'thermowell',touchscreen:'touchscreen',hmi:'hmi',xfmr:'transformer',ctrl:'controller',controllr:'controller',con:'controller',sol:'solenoid',filters:'filter',valves:'valve',kits:'kit',boards:'board',sensors:'sensor',gauges:'gauge',meters:'meter',motors:'motor',screens:'screen',relays:'relay',lesser:'leser',rlf:'relief',rel:'relief',prv:'relief',chk:'check',laser:'leser',lochinvar:'lochinvar',lock:'lock'};
   const syn = w => SYN[w] || w;
+  const normWord = w => { w = String(w).toLowerCase().replace(/^[.\-]+|[.\-]+$/g, ''); return /^[\d.\/]+(in|psi)$/.test(w) ? w : syn(w.replace(/[.\-]/g, '')); };
   // sizes and ratings are specs, not quantities: 2" / 2 inch -> 2in, 100 psig / 5000# -> 100psi
   const FRAC = { '1/2': .5, '1/4': .25, '3/4': .75, '1/8': .125, '3/8': .375, '5/8': .625, '7/8': .875 };
   const specs = t => String(t)
     .replace(/(\d+)(?:\s+|-)(\d\/\d)(?=\s*(?:"|”|''|-?inch|in\b))/gi, (m, w, f) => FRAC[f] != null ? String(+w + FRAC[f]) : m)
     .replace(/(\d+(?:\.\d+)?(?:\s*\/\s*\d+)?)\s*(?:"|”|''|-?inch(?:es)?\b|in\.?(?=\s|$|[,)]))/gi, (m, n) => n.replace(/\s+/g, '') + 'in ')
+    .replace(/(\d+)\s*-\s*(\d+)(?=\s*(?:psig|psgi|psid|psi|#))/gi, '$1psi $2')
     .replace(/(\d+)\s*(?:psig|psgi|psid|psi|pounds?|lbs?|#)(?=[^a-z]|$)/gi, '$1psi ');
   const alnum = s => String(s).toUpperCase().replace(/[^A-Z0-9]/g,'');
 
@@ -72,7 +74,7 @@ const Matcher = (() => {
       const segs = String(p.id).toUpperCase().split(/[^A-Z0-9]+/).filter(s=>s.length>=2);
       const dw = new Map();
       for (const [src, wt] of [[p.type, 0.8], [specs(p.desc), 1]]) for (const w of tokenizeWords(src)) {
-        const ww = syn(w.replace(/[.\-]/g,''));
+        const ww = normWord(w);
         if (ww.length >= 2 && !STOP.has(ww)) dw.set(ww, Math.max(dw.get(ww)||0, wt));
       }
       for (const w of dw.keys()) df.set(w, (df.get(w)||0)+1);
@@ -167,10 +169,12 @@ const Matcher = (() => {
     const n = tokens.length;
     const up = tokens.map(t => alnum(t));
     const res = [];
+    const uSpecs = tokens.map(normWord).filter(t => /^[\d.\/]+(in|psi)$/.test(t));
+    const isSpec = tokens.map(t => /^[\d.\/]+(in|psi)$/.test(normWord(t)));
     // utterance words for description match
     const uw = [];
     tokens.forEach((t,k) => {
-      const w = syn(t.toLowerCase().replace(/[.\-]/g,''));
+      const w = normWord(t);
       if (!w || STOP.has(w)) return;
       if (/^\d+$/.test(w)) { uw.push({k, w, num: true}); return; }
       if (w.length < 2) return;
@@ -182,19 +186,21 @@ const Matcher = (() => {
       for (let a = 0; a < n; a++) {
         let span = '';
         for (let b = a; b < Math.min(n, a+5); b++) {
+          if (isSpec[b]) break;
           span += up[b];
           if (!span) continue;
           const hasD = /\d/.test(span), hasL = /[A-Z]/.test(span);
           const pureDigits = hasD && !hasL;
           if (span.length < 3) continue;
           if (!hasD && span.length < 4) continue;
+          if (!hasD && !it.norm.startsWith(span) && tokens.slice(a, b+1).every(t => index.vocab.has(normWord(t)))) continue;
           let s = 0;
           for (const target of [it.norm, ...it.segs]) {
             let v = 0;
             if (target === span) v = (span.length >= 5 ? 1 : 0.7 + 0.06 * span.length) + 0.015 * Math.min(span.length, 12);
             else if (target.startsWith(span)) v = (pureDigits && span.length < 4) ? 0.5 : 0.6 + 0.4 * Math.min(1, span.length / Math.min(target.length, 7)) + 0.015 * Math.min(span.length, 12);
             else if (span.length >= 4 && target.includes(span)) v = 0.5 + 0.35 * Math.min(1, span.length / 8);
-            else if (span.length >= 4 && (hasD || target === it.norm)) {
+            else if (span.length >= 4 && (hasD || target === it.norm) && !(b > a && /^\d{1,3}$/.test(tokens[b]))) {
               const pre = target.slice(0, span.length + 1);
               v = Math.max(sim(span, target, true), sim(span, pre, true), sim(span, target.slice(0, span.length), true)) * 0.92;
               if (v < 0.6) v = 0;
@@ -245,6 +251,12 @@ const Matcher = (() => {
       let leftover = 0;
       tokens.forEach((t, k) => { if (!consumed.has(k) && /[a-z]/i.test(t) && /\d/.test(t) && t.length >= 2) leftover++; });
       score -= 0.08 * leftover;
+      // a spoken size/rating that contradicts this part's own size/rating (6in said, part is 4in)
+      for (const sp of uSpecs) {
+        const unit = sp.replace(/^[\d.\/]+/, '');
+        const own = it.words.map(w => w[0]).filter(w => /^[\d.\/]+(in|psi)$/.test(w) && w.endsWith(unit));
+        if (own.length && !own.includes(sp)) score -= 0.4;
+      }
       if (score <= 0.15) continue;
       res.push({ part: it.part, idx: it.i, score, pn, desc, pnExact, consumed, leftover, via: pn >= desc ? 'pn' : 'desc' });
     }

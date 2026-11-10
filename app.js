@@ -14,6 +14,12 @@ function splitLoc(loc, fallback) {
   if (!seg.length) return { rack: String(fallback || 'No bin').trim() || 'No bin', bin: '', noBin: true };
   return { rack: seg[0].toUpperCase(), bin: (seg[1] || '').toUpperCase(), noBin: false };
 }
+// ManagerPlus exports stamp a wrong sheet size (e.g. A1:C1) over the real data; measure the cells instead
+function fixRange(sh) {
+  let r1 = Infinity, c1 = Infinity, r2 = -1, c2 = -1;
+  for (const k in sh) { if (k[0] === '!') continue; const a = XLSX.utils.decode_cell(k); if (a.r < r1) r1 = a.r; if (a.c < c1) c1 = a.c; if (a.r > r2) r2 = a.r; if (a.c > c2) c2 = a.c; }
+  if (r2 >= 0) sh['!ref'] = XLSX.utils.encode_range({ s: { r: r1, c: c1 }, e: { r: r2, c: c2 } });
+}
 function prepRows(rows, fallback) { return rows.map(r => ({ ...r, ...splitLoc(r.loc, r.wh || fallback) })); }
 const binLabel = b => b ? b : 'All items';
 const binId = b => 'bin-' + (b || '_');
@@ -77,7 +83,8 @@ $('inFile').addEventListener('change', async e => {
     const wb = XLSX.read(await f.arrayBuffer());
     const rows = [];
     for (const sn of wb.SheetNames) {
-      const aoa = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, raw: true, defval: null });
+      const sh = wb.Sheets[sn]; fixRange(sh);
+      const aoa = XLSX.utils.sheet_to_json(sh, { header: 1, raw: true, defval: null });
       const hi = aoa.findIndex(r => r && r.some(c => /^part\s*id$/i.test(String(c || '').trim())));
       if (hi < 0) continue;
       const H = aoa[hi].map(c => String(c || '').trim().toLowerCase());
