@@ -1,0 +1,268 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0E5E6E"><meta name="apple-mobile-web-app-capable" content="yes"><style>:root{color-scheme:light;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0;font:14px system-ui,sans-serif}img{max-width:100%}[hidden]{display:none!important}</style></head><body><title>Shelf Count</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+/* Layout: one working column; sticky shelf header on top, composer pinned to the bottom like a radio handset; bins stacked as shelf-tag sections between. */
+:root {
+  --bg: #EEF2F1; --surface: #FFFFFF; --sunk: #E3E9E8; --ink: #14212A; --muted: #5A6872; --line: #D2DBDC;
+  --accent: #0E5E6E; --accent-ink: #FFFFFF; --tag: #F3C531; --tag-ink: #1C1A10;
+  --ok: #1E7F48; --ok-bg: #E2F3E8; --warn: #9A6400; --warn-bg: #FBF0D6; --bad: #B83A26; --bad-bg: #FBE5E0;
+  --f-display: "Barlow Semi Condensed", "Arial Narrow", system-ui, sans-serif;
+  --f-body: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --r: 10px;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0D1417; --surface: #152027; --sunk: #0A1013; --ink: #E4ECEE; --muted: #91A1AA; --line: #253640;
+  --accent: #4DB5C7; --accent-ink: #062027; --tag: #E2B62A; --tag-ink: #1C1A10;
+  --ok: #5BCB86; --ok-bg: #12301F; --warn: #E9B34A; --warn-bg: #33260B; --bad: #F08A74; --bad-bg: #3A1810; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #0D1417; --surface: #152027; --sunk: #0A1013; --ink: #E4ECEE; --muted: #91A1AA; --line: #253640;
+  --accent: #4DB5C7; --accent-ink: #062027; --tag: #E2B62A; --tag-ink: #1C1A10;
+  --ok: #5BCB86; --ok-bg: #12301F; --warn: #E9B34A; --warn-bg: #33260B; --bad: #F08A74; --bad-bg: #3A1810; color-scheme: dark; }
+
+html, body { background: var(--bg); color: var(--ink); }
+body { font-family: var(--f-body); font-size: 15px; line-height: 1.45; -webkit-text-size-adjust: 100%; }
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 30; background: var(--surface); }
+button, input, textarea, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mono { font-family: var(--f-mono); font-size: 0.86em; letter-spacing: -0.01em; }
+.num { font-variant-numeric: tabular-nums; }
+.wrap { max-width: 760px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+
+/* header */
+.top { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 20; background: var(--surface); border-bottom: 1px solid var(--line); }
+.top .wrap { padding-block: 10px 8px; display: grid; gap: 8px; }
+.toprow { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.shelfname { font-family: var(--f-display); font-weight: 700; font-size: 28px; line-height: 1; letter-spacing: 0.01em; }
+.shelfmeta { color: var(--muted); font-size: 12.5px; line-height: 1.25; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spacer { flex: 1; }
+.btn { border: 1px solid var(--line); background: var(--surface); border-radius: 8px; padding: 8px 12px; font-weight: 600; font-size: 14px; display: inline-flex; align-items: center; gap: 6px; }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--muted); padding-inline: 8px; }
+.btn.small { padding: 5px 9px; font-size: 13px; }
+.btn:disabled { opacity: 0.45; cursor: default; }
+.progress { height: 6px; background: var(--sunk); border-radius: 3px; overflow: hidden; }
+.progress i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .25s; }
+.bins { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; padding-bottom: 2px; }
+.bins::-webkit-scrollbar { display: none; }
+.binchip { flex: none; min-width: 40px; height: 34px; border-radius: 6px; border: 1px solid var(--line); background: var(--surface); font-family: var(--f-display); font-weight: 700; font-size: 18px; position: relative; padding: 0 8px; }
+.binchip.on { background: var(--tag); color: var(--tag-ink); border-color: var(--tag); }
+.binchip.done::after { content: ""; position: absolute; right: 3px; top: 3px; width: 6px; height: 6px; border-radius: 50%; background: var(--ok); }
+
+/* main */
+main { padding-block: 14px 230px; display: grid; gap: 18px; }
+.section-h { display: flex; align-items: baseline; gap: 8px; font-family: var(--f-display); font-weight: 600; font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+
+/* pending */
+.pending { display: grid; gap: 10px; }
+.pcard { background: var(--surface); border: 1px solid var(--line); border-left: 5px solid var(--warn); border-radius: var(--r); padding: 12px; display: grid; gap: 10px; min-width: 0; }
+.pcard.unknown { border-left-color: var(--bad); }
+.pcard .heard { font-size: 15px; }
+.pcard .heard q { font-weight: 600; }
+.pcard .why { font-size: 12.5px; color: var(--muted); }
+.choices { display: grid; gap: 6px; }
+.choice { text-align: left; border: 1px solid var(--line); background: var(--bg); border-radius: 8px; padding: 9px 10px; display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; min-width: 0; }
+.choice b { font-family: var(--f-mono); font-size: 13px; font-weight: 600; word-break: break-all; }
+.choice span { grid-column: 1; font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.choice .pct { grid-column: 2; grid-row: 1 / span 2; align-self: center; font-family: var(--f-display); font-weight: 600; font-size: 15px; color: var(--muted); }
+.choice.sel { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.prow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.qtyin { width: 76px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); font-family: var(--f-display); font-weight: 700; font-size: 20px; text-align: center; }
+.quickq { display: flex; gap: 4px; }
+.quickq button { width: 38px; height: 38px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); font-family: var(--f-display); font-weight: 700; font-size: 17px; }
+
+/* bins + rows */
+.bin { display: grid; gap: 8px; scroll-margin-top: 150px; }
+.binhead { display: flex; align-items: center; gap: 10px; }
+.tag { display: inline-flex; align-items: center; gap: 6px; background: var(--tag); color: var(--tag-ink); font-family: var(--f-display); font-weight: 700; font-size: 16px; padding: 3px 10px 3px 8px; border-radius: 4px; letter-spacing: 0.02em; }
+.tag small { font-weight: 600; font-size: 12px; opacity: .7; }
+.binhead .cnt { color: var(--muted); font-size: 13px; }
+.rows { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; }
+.row { display: grid; grid-template-columns: 6px 1fr auto; gap: 0 12px; align-items: center; padding: 10px 12px 10px 0; border-top: 1px solid var(--line); min-width: 0; }
+.row:first-child { border-top: 0; }
+.row .stripe { align-self: stretch; background: transparent; }
+.row.counted .stripe { background: var(--ok); }
+.row.zero .stripe { background: var(--bad); }
+.row .info { min-width: 0; display: grid; gap: 2px; }
+.row .pn { font-family: var(--f-mono); font-weight: 600; font-size: 13.5px; word-break: break-all; }
+.row .desc { font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .notes { font-size: 12px; color: var(--warn); }
+.row.flash { animation: flash 1.2s ease-out; }
+@keyframes flash { from { background: var(--ok-bg); } to { background: transparent; } }
+.stepper { display: flex; align-items: center; gap: 4px; }
+.stepper button { width: 36px; height: 36px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); font-size: 20px; font-weight: 600; line-height: 1; }
+.stepper .val { min-width: 34px; text-align: center; font-family: var(--f-display); font-weight: 700; font-size: 24px; }
+.stepper .val.empty { color: var(--muted); font-size: 18px; }
+.rowtools { grid-column: 2 / 4; display: flex; gap: 6px; margin-top: 6px; }
+.rowtools input { flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; background: var(--bg); font-size: 13px; }
+
+/* unlisted */
+.ulist { display: grid; gap: 8px; }
+.ucard { background: var(--surface); border: 1px dashed var(--bad); border-radius: var(--r); padding: 10px 12px; display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: center; min-width: 0; }
+.ucard img { width: 52px; height: 52px; object-fit: cover; border-radius: 6px; }
+.ucard .ph { width: 52px; height: 52px; border-radius: 6px; background: var(--sunk); display: grid; place-items: center; color: var(--muted); font-size: 11px; text-align: center; }
+.ucard .info { min-width: 0; }
+
+/* composer */
+.composer { position: fixed; left: 0; right: 0; bottom: 0; z-index: 25; background: var(--surface); border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom, 0px); box-shadow: 0 -8px 24px rgba(10,20,25,.08); }
+.composer .wrap { padding-block: 8px 10px; display: grid; gap: 8px; }
+.preview { min-height: 40px; display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); min-width: 0; }
+.preview .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); flex: none; }
+.preview.matched .dot { background: var(--ok); } .preview.check .dot, .preview.needqty .dot { background: var(--warn); } .preview.unknown .dot { background: var(--bad); } .preview.location .dot { background: var(--tag); }
+.preview .ptxt { min-width: 0; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; color: var(--ink); }
+.preview .ptxt .mono { font-weight: 600; }
+.cbar { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: end; }
+#say { width: 100%; min-height: 50px; max-height: 120px; resize: none; border: 2px solid var(--line); border-radius: 12px; padding: 12px 12px; font-size: 17px; background: var(--bg); }
+#say:focus { border-color: var(--accent); outline: none; }
+.mic { width: 50px; height: 50px; border-radius: 50%; border: 0; background: var(--sunk); color: var(--ink); display: grid; place-items: center; }
+.mic.live { background: var(--bad); color: #fff; animation: pulse 1.4s infinite; }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(184,58,38,.5); } 70% { box-shadow: 0 0 0 12px rgba(184,58,38,0); } 100% { box-shadow: 0 0 0 0 rgba(184,58,38,0); } }
+.add { height: 50px; padding: 0 18px; border-radius: 12px; border: 0; background: var(--accent); color: var(--accent-ink); font-family: var(--f-display); font-weight: 700; font-size: 19px; letter-spacing: .02em; }
+.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(150px + env(safe-area-inset-bottom, 0px)); z-index: 26; background: var(--ink); color: var(--bg); border-radius: 10px; padding: 10px 12px; display: flex; gap: 12px; align-items: center; max-width: min(92vw, 560px); font-size: 14px; box-shadow: 0 8px 24px rgba(0,0,0,.2); }
+.toast button { background: transparent; border: 0; color: var(--tag); font-weight: 700; padding: 4px; }
+.hintline { font-size: 12px; color: var(--muted); display: flex; gap: 12px; flex-wrap: wrap; }
+.hintline label { display: inline-flex; gap: 5px; align-items: center; }
+
+/* setup + review */
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 18px; display: grid; gap: 14px; }
+.panel h1 { font-family: var(--f-display); font-weight: 700; font-size: 34px; line-height: 1; margin: 0; text-wrap: balance; }
+.panel h2 { font-family: var(--f-display); font-weight: 700; font-size: 20px; margin: 0; }
+.panel p { margin: 0; color: var(--muted); max-width: 62ch; }
+.field { display: grid; gap: 6px; }
+.field label { font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.field input[type=text] { border: 1px solid var(--line); border-radius: 8px; padding: 11px 12px; font-size: 16px; background: var(--bg); }
+.shelfopts { display: grid; gap: 8px; }
+.whbox { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--bg); display: grid; gap: 2px; font-size: 14px; }
+.whbox b { font-weight: 600; } .whbox span { color: var(--muted); font-size: 13px; }
+.rackgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 8px; max-height: 300px; overflow: auto; }
+.rackbtn { border: 1px solid var(--line); background: var(--bg); border-radius: 8px; padding: 8px 6px; display: grid; text-align: center; }
+.rackbtn b { font-family: var(--f-display); font-weight: 700; font-size: 20px; line-height: 1.1; }
+.rackbtn span { font-size: 11.5px; color: var(--muted); }
+.rackbtn.sel { background: var(--tag); color: var(--tag-ink); border-color: var(--tag); } .rackbtn.sel span { color: var(--tag-ink); opacity: .75; }
+.stray { font-size: 11px; font-weight: 700; color: var(--warn); letter-spacing: .04em; text-transform: uppercase; }
+
+.shelfopt { text-align: left; border: 1px solid var(--line); background: var(--bg); border-radius: 10px; padding: 12px; display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; align-items: center; }
+.shelfopt .tag { grid-row: 1 / span 2; font-size: 20px; }
+.shelfopt b { font-weight: 600; }
+.shelfopt span { font-size: 13px; color: var(--muted); }
+.shelfopt.sel { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.howto { display: grid; gap: 6px; font-size: 14px; margin: 0; padding-left: 20px; }
+.howto code { font-family: var(--f-mono); font-size: 12.5px; background: var(--sunk); padding: 1px 5px; border-radius: 4px; }
+
+.stats { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
+@media (min-width: 560px) { .stats { grid-template-columns: repeat(4, minmax(0,1fr)); } }
+.stat { background: var(--bg); border-radius: 10px; padding: 10px 12px; display: grid; gap: 2px; }
+.stat small { font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+.stat b { font-family: var(--f-display); font-weight: 700; font-size: 24px; }
+.stat.pos b { color: var(--ok); } .stat.neg b { color: var(--bad); }
+.tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; min-width: 560px; }
+th, td { padding: 8px 10px; text-align: left; border-top: 1px solid var(--line); vertical-align: top; }
+th { font-size: 11.5px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); background: var(--bg); border-top: 0; font-weight: 600; }
+td.r, th.r { text-align: right; }
+tr.over td.v { color: var(--ok); font-weight: 600; } tr.under td.v { color: var(--bad); font-weight: 600; }
+.callout { border-radius: 10px; padding: 10px 12px; background: var(--warn-bg); color: var(--ink); font-size: 14px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.empty-note { color: var(--muted); font-size: 14px; }
+.sheet { position: fixed; inset: 0; z-index: 40; background: rgba(8,14,18,.5); display: grid; align-items: end; }
+.sheet .panel { border-radius: 16px 16px 0 0; max-height: 88vh; overflow: auto; padding-bottom: calc(18px + env(safe-area-inset-bottom, 0px)); }
+.sheet .wrap { width: 100%; box-sizing: border-box; }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+
+<header class="top" id="top" hidden>
+  <div class="wrap">
+    <div class="toprow">
+      <div class="shelfname" id="hShelf">CI8</div>
+      <div class="shelfmeta" id="hMeta"></div>
+      <div class="spacer"></div>
+      <button class="btn small" id="toReview">Finish</button>
+    </div>
+    <div class="progress" aria-hidden="true"><i id="hBar"></i></div>
+    <div class="bins" id="hBins" role="toolbar" aria-label="Current bin"></div>
+  </div>
+</header>
+
+<div class="wrap">
+  <!-- SETUP -->
+  <section id="vSetup" hidden>
+    <div style="padding-block: 18px 40px; display: grid; gap: 14px;">
+      <div class="panel">
+        <h1>Shelf Count</h1>
+        <p>Say or type what's on the rack. The app finds the closest part on the ManagerPlus list, even from half a part number or a description. Counters never see system quantities.</p>
+        <div class="field">
+          <label for="inName">Counter</label>
+          <input type="text" id="inName" placeholder="Your name" autocomplete="name">
+        </div>
+        <div class="field">
+          <label>Warehouse list</label>
+          <div class="whbox" id="whBox"></div>
+          <div class="prow">
+            <label class="btn small" for="inFile" id="upLbl">Upload whole-warehouse export (.xlsx)</label>
+            <input type="file" id="inFile" accept=".xlsx,.xls,.csv" hidden>
+          </div>
+          <div class="empty-note" id="fileMsg"></div>
+        </div>
+        <div class="field">
+          <label>Rack to count</label>
+          <div class="rackgrid" id="rackGrid"></div>
+        </div>
+        <div class="prow"><button class="btn primary" id="startBtn">Start counting</button><button class="btn" id="resumeBtn" hidden>Resume</button></div>
+      </div>
+      <div class="panel">
+        <h2>How to talk to it</h2>
+        <ol class="howto">
+          <li>Announce the shelf: <code>shelf A</code>, <code>now on shelf dee</code>, or <code>rack CI2 shelf A</code>.</li>
+          <li>Say part, then count: <code>EC350 one</code>, <code>HP kit three</code>.</li>
+          <li>No clear number? Use the description: <code>Lochinvar touch screen 1, PN guess 1100317</code>.</li>
+          <li>Say <code>next</code> between parts, or tap Add. Several parts can go in one breath.</li>
+          <li>Nothing there: <code>Crosby PRV 100 psi not found</code> logs a zero.</li>
+          <li>Yellow cards need one tap. Red cards aren't on this rack's list: the app checks the rest of the warehouse, or you log the part as "not in system" with a photo.</li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- COUNT -->
+  <main id="vCount" hidden>
+    <div class="pending" id="pending"></div>
+    <div id="binsList" style="display:grid; gap:18px;"></div>
+    <div id="unlistedWrap" hidden>
+      <div class="section-h" style="margin-bottom:8px;">Found here, not in the warehouse list</div>
+      <div class="ulist" id="unlisted"></div>
+    </div>
+    <div class="prow"><button class="btn" id="addUnlistedBtn">+ Add a part that isn't on the list</button></div>
+  </main>
+
+  <!-- REVIEW -->
+  <section id="vReview" hidden>
+    <div style="padding-block: 18px 60px; display: grid; gap: 14px;">
+      <div class="panel" id="reviewPanel"></div>
+    </div>
+  </section>
+</div>
+
+<!-- composer -->
+<div class="composer" id="composer" hidden>
+  <div class="wrap">
+    <div class="preview" id="preview"><span class="dot"></span><span class="ptxt" id="ptxt">Tap the box, then the keyboard mic. Say “bin D” to start.</span></div>
+    <div class="cbar">
+      <button class="mic" id="micBtn" hidden aria-label="Start talking">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4"/></svg>
+      </button>
+      <textarea id="say" rows="1" placeholder="EC350 one… next… HP kit three" enterkeyhint="send" autocapitalize="characters" autocomplete="off" spellcheck="false" aria-label="Say or type a part and count"></textarea>
+      <button class="add" id="addBtn">Add</button>
+    </div>
+    <div class="hintline"><span id="binHint">Bin: none set</span><label><input type="checkbox" id="optSpeak"> Read back</label></div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden><span id="toastTxt"></span><button id="toastUndo">Undo</button></div>
+<div class="sheet" id="sheet" hidden><div class="wrap"><div class="panel" id="sheetPanel"></div></div></div>
+
+<script src="matcher.js"></script>
+<script src="app.js"></script>
+</body></html>
