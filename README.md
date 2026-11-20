@@ -16,12 +16,24 @@ It's a static site with no build step. Vercel serves it as-is (Framework preset:
 
 ## Using it
 
-1. Export the whole warehouse from ManagerPlus as .xlsx. It needs `Part ID`, `Description`, `On Hand` and `Current Cost` columns, plus `Bin Location` where the location has bins.
-2. Open the app, upload the export, and pick a rack. The list stays on that phone only and is never sent anywhere.
-3. Count. Yellow cards need one tap; red cards are parts that aren't on that rack.
-4. Finish:
-   - **Save count file** is the blind export (counts only).
-   - **Manager view** (PIN) shows variance and saves the CI5-format workbook with live formulas.
+1. Sign in with your name and PIN (same people and PINs as the Parts Receiving app).
+2. Pick a warehouse and tap **Load from ManagerPlus**. The app pulls that warehouse's parts, bins and on-hand live through n8n. Uploading a ManagerPlus .xlsx export still works as a fallback.
+3. Pick a rack and count. Yellow cards need one tap; red cards are parts that aren't on that rack, and the app shows where the system thinks they are.
+4. Every line saves to the server a few seconds after you count it, with the time it was counted. With no signal, lines wait on the phone and upload when signal returns (the badge in the header shows how many are waiting).
+5. **Finish this count** sends every line, with anything not counted saved as 0 "not found", and marks the count finished.
+6. Managers see the variance view; counters never see system quantities. Saving the Excel/CSV files still works.
+
+## Back end
+
+| Piece | Where |
+|---|---|
+| n8n workflow **Inventory Count API** | webhook `POST /webhook/inventory-count`, actions `names`, `login`, `load`, `save`, `sessions`, `session` |
+| Data table `count_sessions` | one row per count: warehouse, rack/area, counter, started/finished time |
+| Data table `count_lines` | one row per counted line: part, qty counted, **system on-hand at count time**, system bin vs bin found, counted-at timestamp, notes |
+| `n8n/` | source of the workflow's Code nodes |
+| `tools/import_counts.py` | loads old count spreadsheets as dated sessions |
+
+People, PINs and the warehouse list live in the workflow's **Gatekeeper** node (edit the block at the top). Put `| manager` after a PIN to let that person see variances.
 
 ## Locations without bins
 

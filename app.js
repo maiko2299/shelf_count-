@@ -3,7 +3,20 @@ const BUILTIN_WH = {"name": "", "rows": []};
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const money = n => (n < 0 ? '-$' : '$') + Math.abs(n).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
-const KEY = 'shelfcount.session.v2', WHKEY = 'shelfcount.wh.v2';
+const KEY = 'shelfcount.session.v2', WHKEY = 'shelfcount.wh.v2', AUTHKEY = 'shelfcount.auth.v1';
+const API = 'https://n8n.ngadvantage.com/webhook/inventory-count';
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2, 10));
+// form-encoded POST keeps it a "simple" request (no CORS preflight), same as the Parts Receiving app
+async function api(action, body = {}, timeoutMs = 90000) {
+  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const payload = JSON.stringify({ action, name: AUTH && AUTH.name, pin: AUTH && AUTH.pin, ...body });
+    const res = await fetch(API, { method: 'POST', body: new URLSearchParams({ payload }), signal: ctl.signal });
+    const j = await res.json().catch(() => null);
+    if (!j) throw new Error('The server sent back nothing usable.');
+    return j;
+  } finally { clearTimeout(t); }
+}
 const store = {
   get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { return false; } },
@@ -25,7 +38,9 @@ const binLabel = b => b ? b : 'All items';
 const binId = b => 'bin-' + (b || '_');
 const hasShelves = () => S && S.parts.some(p => p.bin);
 
-let WH = store.get(WHKEY) || { name: BUILTIN_WH.name, file: 'built-in sample', loadedAt: null, rows: prepRows(BUILTIN_WH.rows), pin: null, builtin: true };
+let AUTH = store.get(AUTHKEY); // { name, pin, manager, warehouses }
+let WH = store.get(WHKEY) || { name: BUILTIN_WH.name, file: 'built-in sample', loadedAt: null, rows: prepRows(BUILTIN_WH.rows), builtin: true };
+let pickedWh = WH.key || null;
 let S = null, index = null, whIndex = null, whOthers = [];
 let undoStack = [];
 let dict = null, downloads = null, tts = null;
@@ -36,7 +51,83 @@ function racks() {
   const m = new Map(); for (const r of WH.rows) m.set(r.rack, (m.get(r.rack) || 0) + 1);
   return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }));
 }
-function save() { if (S) store.set(KEY, S); }
+function save() { if (!S) return true; const ok = store.set(KEY, S); scheduleSync(); return ok; }
+
+/* ---------------- server sync ----------------
+   Every change marks a line dirty. queueDirty() copies dirty lines into an outbox kept on the phone;
+   flushSync() sends the outbox to n8n. Line ids are stable, so re-sending a line updates it. */
+const OUTKEY = 'shelfcount.outbox.v1';
+let OUT = store.get(OUTKEY) || {}; let syncT = 0, syncing = false, syncErr = '';
+const foundAt = bin => bin ? `\\${S.rack}\\${bin}` : S.rack;
+function markLine(ref, snap) { if (!S) return; S.dirty = S.dirty || {}; S.dirty[ref] = snap || 1; }
+function markAll() { if (S) S.sessionDirty = true; }
+function sessionMeta(extra = {}) {
+  const lineCount = Object.keys(S.counts).length + S.strays.length + S.unlisted.length;
+  return { id: S.id, warehouseKey: S.whKey, warehouseName: S.whName, area: S.rack, counter: S.counter, startedAt: S.startedAt, finishedAt: S.finishedAt || null, source: 'app', lineCount, notes: `list loaded ${S.listLoadedAt || '?'} from ${S.whFile || '?'}`, ...extra };
+}
+function lineFor(ref, snap, opts = {}) {
+  const [kind, k] = [ref.slice(0, 1), ref.slice(2)];
+  const base = { area: S.rack, counter: S.counter, source: 'app' };
+  if (kind === 'r') {
+    const p = S.parts[+k]; if (!p) return null; const c = S.counts[+k];
+    const line = { ...base, id: `${S.id}:r:${p.key ?? p.id}`, partKey: p.key ?? null, partId: p.id, desc: p.desc, systemBin: p.loc || '', systemOnHand: +p.onHand || 0, cost: +p.cost || 0 };
+    if (!c) return opts.finishing ? { ...line, qty: 0, foundBin: '', countedAt: new Date().toISOString(), status: 'not_counted', notes: 'Not found in count - verify' }
+      : { ...line, qty: null, foundBin: '', countedAt: new Date().toISOString(), status: 'cleared' };
+    return { ...line, qty: c.qty, foundBin: foundAt(c.foundBin || p.bin), countedAt: c.at || new Date().toISOString(), heard: (c.heard || []).join(' | '), status: c.status || 'manual', confidence: c.conf != null ? Math.round(Math.min(1, c.conf) * 100) : null, notes: [...c.notes, c.manualNote].filter(Boolean).join('; ') };
+  }
+  if (kind === 's') {
+    const st = S.strays.find(x => x.id === k) || (snap && snap.gone ? { ...snap.st, qty: 0, removed: true } : null); if (!st) return null;
+    return { ...base, id: `${S.id}:s:${st.id}`, partKey: st.part.key ?? null, partId: st.part.id, desc: st.part.desc, systemBin: st.part.loc || `${st.part.rack} (no bin)`, systemOnHand: +st.part.onHand || 0, cost: +st.part.cost || 0, qty: st.qty, foundBin: st.foundBin || S.rack, countedAt: st.at || new Date().toISOString(), status: st.removed ? 'removed' : 'other_location', notes: (st.notes || []).join('; ') };
+  }
+  if (kind === 'u') {
+    const u = S.unlisted.find(x => x.id === k) || (snap && snap.gone ? { ...snap.u, deleted: true } : null); if (!u) return null;
+    return { ...base, id: `${S.id}:u:${u.id}`, partKey: null, partId: u.pn, desc: u.desc, systemBin: '', systemOnHand: null, cost: null, qty: u.deleted ? 0 : u.qty, foundBin: foundAt(u.bin), countedAt: u.at || new Date().toISOString(), status: u.deleted ? 'deleted' : 'not_in_system', unlisted: true, notes: [u.notes, u.photo ? 'photo on counter’s phone' : ''].filter(Boolean).join('; ') };
+  }
+  return null;
+}
+function queueDirty(opts = {}) {
+  if (!S || !S.id) return;
+  const refs = opts.finishing ? [...S.parts.map((_, i) => 'r:' + i), ...Object.keys(S.dirty || {}).filter(r => r[0] !== 'r')] : Object.keys(S.dirty || {});
+  if (!refs.length && !S.sessionDirty && !opts.finishing) return;
+  const box = OUT[S.id] = OUT[S.id] || { lines: {} };
+  box.session = sessionMeta();
+  for (const ref of new Set(refs)) { const l = lineFor(ref, (S.dirty || {})[ref], opts); if (l) box.lines[l.id] = l; }
+  S.dirty = {}; S.sessionDirty = false;
+  store.set(OUTKEY, OUT); store.set(KEY, S);
+}
+function waitingCount() { return Object.values(OUT).reduce((n, b) => n + Math.max(1, Object.keys(b.lines).length), 0) + (S ? Object.keys(S.dirty || {}).length : 0); }
+function scheduleSync() { clearTimeout(syncT); syncT = setTimeout(flushSync, 2500); renderSync(); }
+async function flushSync() {
+  clearTimeout(syncT);
+  queueDirty();
+  if (syncing || !AUTH) { renderSync(); return; }
+  syncing = true; renderSync();
+  try {
+    for (const sid of Object.keys(OUT)) {
+      const box = OUT[sid]; const ids = Object.keys(box.lines);
+      do {
+        const chunk = ids.splice(0, 400);
+        const r = await api('save', { session: box.session, lines: chunk.map(id => box.lines[id]) }, 60000);
+        if (!r.ok) throw new Error(r.error || 'save failed');
+        for (const id of chunk) delete box.lines[id];
+        store.set(OUTKEY, OUT);
+      } while (ids.length);
+      if (!Object.keys(box.lines).length) delete OUT[sid];
+      store.set(OUTKEY, OUT);
+    }
+    syncErr = ''; if (S) S.lastSync = new Date().toISOString();
+  } catch (e) { syncErr = navigator.onLine === false || e.name === 'AbortError' || e instanceof TypeError ? 'offline' : (e.message || 'error'); }
+  syncing = false; renderSync();
+}
+function renderSync() {
+  const el = $('hSync'); if (!el) return;
+  const n = waitingCount();
+  el.hidden = !S; el.className = 'sync' + (n ? (syncErr ? ' off' : ' wait') : '');
+  el.textContent = !AUTH ? 'Not signed in' : n ? (syncErr === 'offline' ? `Offline · ${n} waiting` : syncErr ? `Sync problem · ${n}` : syncing ? 'Saving…' : `${n} to save`) : 'Saved';
+  el.title = syncErr && syncErr !== 'offline' ? syncErr : '';
+}
+setInterval(() => { if (waitingCount()) flushSync(); }, 30000);
+window.addEventListener('online', flushSync);
 function setIndex() {
   index = Matcher.buildIndex(S.parts);
   whOthers = WH.rows.filter(r => r.rack !== S.rack);
@@ -46,38 +137,137 @@ function getWhIndex() { if (!whIndex) whIndex = Matcher.buildIndex(whOthers); re
 function partByKey(k) { const [src, i] = k.split(':'); return src === 'r' ? S.parts[+i] : whOthers[+i]; }
 
 /* ---------------- setup ---------------- */
+const whName = k => ((AUTH && AUTH.warehouses) || []).find(w => w.key === +k)?.name || '';
+const listForPicked = () => WH.key && WH.key === pickedWh;
+function renderAuth() {
+  $('signInBox').hidden = !!AUTH; $('signedBox').hidden = !AUTH;
+  if (AUTH) { $('whoName').textContent = AUTH.name; $('whoRole').textContent = AUTH.manager ? 'manager' : 'counter'; }
+  const whs = (AUTH && AUTH.warehouses) || [];
+  const sites = [...new Set(whs.map(w => w.site))];
+  $('inWh').innerHTML = `<option value="">${AUTH ? 'Pick a warehouse…' : 'Sign in to pick a warehouse'}</option>` + sites.map(s => `<optgroup label="${esc(s)}">${whs.filter(w => w.site === s).map(w => `<option value="${w.key}" ${w.key === +pickedWh ? 'selected' : ''}>${esc(w.name)}</option>`).join('')}</optgroup>`).join('');
+  $('inWh').disabled = !AUTH; $('loadBtn').disabled = !AUTH || !pickedWh;
+}
+async function loadNames() {
+  if (AUTH) return;
+  try { const r = await api('names', {}, 20000); if (r.ok) $('inWho').innerHTML = '<option value="">Your name…</option>' + r.people.map(n => `<option>${esc(n)}</option>`).join(''); }
+  catch { $('signMsg').textContent = 'Can’t reach the server. Check the signal, then reload.'; }
+}
+$('signInBtn').addEventListener('click', async () => {
+  const name = $('inWho').value, pin = $('inPin').value.trim();
+  if (!name || !pin) { $('signMsg').textContent = 'Pick your name and enter your PIN.'; return; }
+  $('signMsg').textContent = 'Signing in…';
+  try {
+    const r = await api('login', { name, pin }, 20000);
+    if (!r.ok) { $('signMsg').textContent = r.error || 'Sign-in failed.'; return; }
+    AUTH = { name: r.name, pin, manager: !!r.manager, warehouses: r.warehouses || [] }; store.set(AUTHKEY, AUTH);
+    $('inPin').value = ''; $('signMsg').textContent = ''; renderSetup(); flushSync();
+  } catch { $('signMsg').textContent = 'Can’t reach the server. Try again with signal.'; }
+});
+$('signOutBtn').addEventListener('click', () => { AUTH = null; store.del(AUTHKEY); managerOpen = false; renderSetup(); loadNames(); });
+$('inWh').addEventListener('change', () => { pickedWh = +$('inWh').value || null; pickedRack = null; renderSetup(); });
+$('loadBtn').addEventListener('click', async () => {
+  if (!pickedWh) return;
+  $('fileMsg').textContent = 'Loading from ManagerPlus…'; $('loadBtn').disabled = true;
+  try {
+    const r = await api('load', { warehouseKey: pickedWh }, 120000);
+    if (!r.ok) throw new Error(r.error || 'load failed');
+    const rows = r.parts.map(p => ({ key: p.key, id: p.id, type: p.type, desc: p.desc, status: p.status, loc: p.loc, wh: '', avail: p.available, onHand: p.onHand, cost: p.cost }));
+    const name = r.warehouse.name;
+    WH = { key: r.warehouse.key, name, site: r.warehouse.site, file: 'ManagerPlus (live)', source: 'live', loadedAt: r.loadedAt, rows: prepRows(rows, name), builtin: false };
+    const ok = store.set(WHKEY, WH);
+    $('fileMsg').textContent = `Loaded ${rows.length} parts from ManagerPlus.${ok ? '' : ' (Too big to keep on this phone; load again if you close the page.)'}`;
+    pickedRack = null; renderSetup();
+  } catch (err) { $('fileMsg').textContent = 'Could not load: ' + (err.name === 'AbortError' ? 'ManagerPlus took too long.' : err.message) + ' You can still upload an export.'; }
+  $('loadBtn').disabled = false;
+});
+let pastFor = null;
+async function renderPast(force) {
+  const box = $('pastList');
+  if (!AUTH || !pickedWh) { $('pastPanel').hidden = true; pastFor = null; return; }
+  if (!force && pastFor === pickedWh) return;
+  pastFor = pickedWh;
+  $('pastPanel').hidden = false; box.innerHTML = '<span class="empty-note">Loading…</span>';
+  try {
+    const r = await api('sessions', { warehouseKey: pickedWh }, 30000);
+    if (!r.ok) throw new Error(r.error);
+    const rows = (r.sessions || []).filter(s => s.source !== 'test');
+    box.innerHTML = rows.length ? `<div class="past">${rows.map(s => `<div class="pastrow"><b>${esc(s.area || '—')}</b>
+      <span>${new Date(s.startedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })} · ${esc(s.counter)} · ${s.lineCount || 0} lines · ${s.status === 'finished' ? 'finished' : 'open'}${s.source && s.source !== 'app' ? ' · ' + esc(s.source) : ''}</span>
+      ${s.status !== 'finished' && s.source === 'app' && listForPicked() && (!S || S.id !== s.id) ? `<button class="btn small" data-resume="${esc(s.id)}">Continue</button>` : ''}</div>`).join('')}</div>` : '<span class="empty-note">No counts saved for this warehouse yet.</span>';
+  } catch { box.innerHTML = '<span class="empty-note">Couldn’t load past counts (no signal?).</span>'; }
+}
+$('pastRefresh').addEventListener('click', () => renderPast(true));
+$('pastList').addEventListener('click', async e => {
+  const b = e.target.closest('[data-resume]'); if (!b) return;
+  b.disabled = true; b.textContent = 'Loading…';
+  try { await resumeFromServer(b.dataset.resume); } catch (err) { b.textContent = 'Failed'; $('fileMsg').textContent = 'Could not continue that count: ' + err.message; }
+});
 function renderSetup() {
   $('top').hidden = true; $('composer').hidden = true; $('vCount').hidden = true; $('vReview').hidden = true; $('vSetup').hidden = false;
+  renderAuth();
   const saved = store.get(KEY);
-  if (!$('inName').value) $('inName').value = (saved && saved.counter) || store.get('shelfcount.name') || '';
   $('resumeBtn').hidden = !(saved && saved.parts);
   if (saved && saved.parts) $('resumeBtn').textContent = `Resume ${saved.rack} (${Object.keys(saved.counts).length} of ${saved.parts.length} lines)`;
-  const rk = racks();
-  $('startBtn').disabled = !rk.length;
-  if (!rk.length) { $('whBox').innerHTML = '<b>No warehouse list loaded yet</b><span>Upload the ManagerPlus inventory export for the whole warehouse (Part ID, Description, Bin Location, On Hand, Current Cost). It stays on this phone.</span>'; $('upLbl').textContent = 'Upload whole-warehouse export (.xlsx)'; $('rackGrid').innerHTML = '<span class="empty-note">Racks appear here after the upload.</span>'; return; }
-  $('whBox').innerHTML = `<b>${esc(WH.name)}</b><span>${WH.rows.length} lines on ${rk.length} racks · ${WH.builtin ? 'sample list: CI5 and CI8 only. Upload the full warehouse export to count other racks.' : `from ${esc(WH.file)}, loaded ${new Date(WH.loadedAt).toLocaleDateString()}`}</span>`;
-  $('upLbl').textContent = WH.builtin ? 'Upload whole-warehouse export (.xlsx)' : 'Replace with a newer export';
-  if (!pickedRack || !rk.some(([r]) => r === pickedRack)) pickedRack = rk.some(([r]) => r === 'CI8') ? 'CI8' : (rk[0] || [null])[0];
+  const rk = listForPicked() ? racks() : [];
+  if (!rk.length) $('loadBtn').textContent = 'Load from ManagerPlus';
+  $('startBtn').disabled = !rk.length || !AUTH;
+  renderPast();
+  if (!rk.length) {
+    $('whBox').innerHTML = !AUTH ? '<b>Sign in first</b><span>Your name and PIN are the same as the Parts Receiving app.</span>' : !pickedWh ? '<b>Pick a warehouse</b><span>Then load its parts list live from ManagerPlus.</span>' : `<b>${esc(whName(pickedWh))}</b><span>Not loaded on this phone yet. Tap Load from ManagerPlus.</span>`;
+    $('rackGrid').innerHTML = '<span class="empty-note">Racks appear here after the list loads.</span>'; return;
+  }
+  $('whBox').innerHTML = `<b>${esc(WH.name)}</b><span>${WH.rows.length} parts on ${rk.length} rack${rk.length > 1 ? 's' : ''} · ${esc(WH.file)}, loaded ${new Date(WH.loadedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</span>`;
+  $('loadBtn').textContent = 'Reload from ManagerPlus';
+  if (!pickedRack || !rk.some(([r]) => r === pickedRack)) pickedRack = (rk[0] || [null])[0];
   const noBinRacks = new Set(WH.rows.filter(x => x.noBin).map(x => x.rack));
   $('rackGrid').innerHTML = rk.map(([r, n]) => `<button class="rackbtn ${r === pickedRack ? 'sel' : ''} ${r.length > 7 ? 'long' : ''}" data-r="${esc(r)}" aria-pressed="${r === pickedRack}"><b>${esc(r)}</b><span>${n} lines${noBinRacks.has(r) ? ' · no bins' : ''}</span></button>`).join('');
 }
 $('rackGrid').addEventListener('click', e => { const b = e.target.closest('.rackbtn'); if (!b) return; pickedRack = b.dataset.r; renderSetup(); });
 $('startBtn').addEventListener('click', () => {
-  const name = $('inName').value.trim();
-  if (!name) { $('inName').focus(); $('inName').placeholder = 'Enter your name to start'; return; }
+  if (!AUTH) return;
+  const name = AUTH.name;
   if (!pickedRack) return;
   const saved = store.get(KEY);
   if (saved && saved.parts && Object.keys(saved.counts).length && !$('startBtn').dataset.confirm) {
     $('startBtn').dataset.confirm = '1'; $('startBtn').textContent = `Discard saved ${saved.rack} count and start ${pickedRack}?`; return;
   }
   delete $('startBtn').dataset.confirm; $('startBtn').textContent = 'Start counting';
-  store.set('shelfcount.name', name);
-  S = { v: 2, counter: name, rack: pickedRack, whName: WH.name, whFile: WH.file, parts: WH.rows.filter(r => r.rack === pickedRack).map(r => ({ ...r })), counts: {}, pending: [], unlisted: [], strays: [], log: [], bin: null, startedAt: new Date().toISOString(), seq: 1 };
-  setIndex(); save(); showCount();
+  S = newSession(name, pickedRack);
+  setIndex(); markAll(); save(); showCount(); flushSync();
 });
-$('resumeBtn').addEventListener('click', () => { S = store.get(KEY); const n = $('inName').value.trim(); if (n) S.counter = n; setIndex(); showCount(); });
+function newSession(name, rack, id) {
+  return { v: 2, id: id || uid(), counter: name, rack, whKey: WH.key, whName: WH.name, whFile: WH.file, listLoadedAt: WH.loadedAt, parts: WH.rows.filter(r => r.rack === rack).map(r => ({ ...r })), counts: {}, pending: [], unlisted: [], strays: [], log: [], bin: null, startedAt: new Date().toISOString(), seq: 1, dirty: {}, sessionDirty: true, lastSync: null };
+}
+$('resumeBtn').addEventListener('click', () => { S = store.get(KEY); if (AUTH) S.counter = S.counter || AUTH.name; upgradeSession(); setIndex(); showCount(); flushSync(); });
+// Continue an open count started on another phone (or after this phone was wiped)
+async function resumeFromServer(sessionId) {
+  const [list, det] = await Promise.all([api('sessions', { warehouseKey: pickedWh }, 30000), api('session', { sessionId }, 30000)]);
+  if (!list.ok || !det.ok) throw new Error(list.error || det.error || 'server error');
+  const meta = list.sessions.find(s => s.id === sessionId); if (!meta) throw new Error('count not found');
+  const saved = store.get(KEY);
+  if (saved && saved.parts && saved.id !== sessionId && Object.keys(saved.counts).length && !confirm(`This phone has an unfinished ${saved.rack} count. Replace it?`)) throw new Error('cancelled');
+  S = newSession(AUTH.name, meta.area, sessionId);
+  S.startedAt = meta.startedAt; S.sessionDirty = false;
+  const byKey = new Map(S.parts.map((p, i) => [String(p.key ?? p.id), i]));
+  for (const l of det.lines) {
+    const kind = String(l.id).split(':')[1];
+    if (kind === 'r') { const i = byKey.get(String(l.partKey ?? l.partId)); if (i == null || l.qty == null) continue;
+      S.counts[i] = { qty: +l.qty, notes: l.notes ? String(l.notes).split('; ').filter(Boolean) : [], heard: l.heard ? [l.heard] : [], parts: [+l.qty], manualNote: '', at: l.countedAt, foundBin: (String(l.foundBin).split('\\')[2] || ''), status: l.status, conf: l.confidence }; }
+    else if (kind === 's' && l.qty) { const p = WH.rows.find(r => String(r.key) === String(l.partKey)) || { id: l.partId, desc: l.desc, loc: l.systemBin, rack: '', onHand: 0, cost: l.cost };
+      S.strays.push({ id: String(l.id).split(':')[2], part: { ...p }, qty: +l.qty, notes: l.notes ? String(l.notes).split('; ') : [], parts: [+l.qty], at: l.countedAt, foundBin: l.foundBin }); }
+    else if (kind === 'u' && l.status !== 'deleted') S.unlisted.push({ id: String(l.id).split(':')[2], pn: l.partId, desc: l.desc, qty: +l.qty || 0, bin: String(l.foundBin).split('\\')[2] || '', notes: l.notes || '', photo: null, at: l.countedAt });
+  }
+  S.seq = 1000 + det.lines.length;
+  setIndex(); save(); showCount();
+}
+function upgradeSession() {
+  if (!S) return;
+  if (!S.id) { S.id = uid(); S.sessionDirty = true; markAll(); }
+  S.dirty = S.dirty || {}; if (S.whKey == null) S.whKey = WH.key;
+}
 $('inFile').addEventListener('change', async e => {
   const f = e.target.files[0]; if (!f) return;
+  if (!pickedWh) { $('fileMsg').textContent = 'Pick which warehouse this export is for first.'; e.target.value = ''; return; }
   $('fileMsg').textContent = 'Reading…';
   try {
     const wb = XLSX.read(await f.arrayBuffer());
@@ -98,8 +288,8 @@ $('inFile').addEventListener('change', async e => {
       }
     }
     if (!rows.length) throw new Error('No sheet with a "Part ID" header and part rows');
-    const whName = f.name.replace(/\.(xlsx|xls|csv)$/i, '');
-    WH = { name: whName, file: f.name, loadedAt: new Date().toISOString(), rows: prepRows(rows, whName), pin: WH.pin, builtin: false };
+    const wn = whName(pickedWh) || f.name.replace(/\.(xlsx|xls|csv)$/i, '');
+    WH = { key: pickedWh, name: wn, file: f.name, source: 'file', loadedAt: new Date().toISOString(), rows: prepRows(rows, wn), builtin: false };
     const ok = store.set(WHKEY, WH);
     $('fileMsg').textContent = `Loaded ${rows.length} lines.${ok ? '' : ' (Too big to keep on this phone; re-upload if you close the page.)'}`;
     pickedRack = null; renderSetup();
@@ -110,7 +300,7 @@ $('inFile').addEventListener('change', async e => {
 /* ---------------- counting ---------------- */
 function showCount() {
   $('vSetup').hidden = true; $('vReview').hidden = true; $('vCount').hidden = false; $('top').hidden = false; $('composer').hidden = false;
-  renderAll(); updatePreview();
+  renderAll(); updatePreview(); renderSync();
 }
 function binsInOrder() { return [...new Set(S.parts.map(p => p.bin))].sort(); }
 function renderHeader() {
@@ -193,6 +383,11 @@ function applyCount(i, qty, opts = {}) {
   if (opts.bin && p.bin && opts.bin !== p.bin) addNote(c, `Found on shelf ${opts.bin}, system shows ${p.bin} - relocate/update bin`);
   if (opts.bin && !p.bin && hasShelves()) addNote(c, `Found on shelf ${opts.bin}, no bin in system - assign bin`);
   if (qty === 0 && opts.notFound) addNote(c, 'Not found in count - verify');
+  c.at = new Date().toISOString();
+  if (opts.bin) c.foundBin = opts.bin; else if (!c.foundBin) c.foundBin = S.bin || p.bin || '';
+  if (opts.status || !c.status) c.status = opts.status || 'manual';
+  if (opts.conf != null) c.conf = opts.conf;
+  markLine('r:' + i);
   logIt({ ...opts, part: p.id, qty });
   undoStack.push({ type: 'count', i, prev, logLen: S.log.length - 1 });
   save(); return c;
@@ -206,14 +401,19 @@ function applyStray(wi, qty, opts = {}) {
   const here = opts.bin ? `\\${S.rack}\\${opts.bin}` : S.rack, there = p.loc || `${p.rack} (no bin)`;
   addNote(st, `Found on ${here}, system shows ${there} - relocate/update bin`);
   if (st.parts.length > 1) { st.notes = st.notes.filter(n => !/^Logged as /.test(n)); addNote(st, `Logged as ${st.parts.join(' + ')}`); }
+  st.at = new Date().toISOString(); st.foundBin = foundAt(opts.bin); markLine('s:' + st.id);
   logIt({ ...opts, part: p.id + ' (system ' + p.loc + ')', qty, status: 'stray' });
   undoStack.push({ type: 'strays', prev: prevStrays, logLen: S.log.length - 1 });
   save(); return st;
 }
+function markStrays(before) {
+  for (const st of S.strays) markLine('s:' + st.id);
+  for (const st of before) if (!S.strays.some(x => x.id === st.id)) markLine('s:' + st.id, { gone: true, st: JSON.parse(JSON.stringify(st)) });
+}
 function undo() {
   const u = undoStack.pop(); if (!u) return;
-  if (u.type === 'count') { if (u.prev) S.counts[u.i] = u.prev; else delete S.counts[u.i]; S.log.length = u.logLen; }
-  if (u.type === 'strays') { S.strays = u.prev; S.log.length = u.logLen; }
+  if (u.type === 'count') { if (u.prev) S.counts[u.i] = u.prev; else delete S.counts[u.i]; S.log.length = u.logLen; markLine('r:' + u.i); }
+  if (u.type === 'strays') { const before = S.strays; S.strays = u.prev; S.log.length = u.logLen; markStrays(before); }
   if (u.type === 'pending') S.pending = S.pending.filter(p => p.id !== u.id);
   if (u.type === 'bin') S.bin = u.prev;
   save(); renderAll(); hideToast(); updatePreview();
@@ -298,14 +498,15 @@ $('binsList').addEventListener('click', e => {
   const srow = e.target.closest('[data-sid]');
   if (srow) { const st = S.strays.find(x => x.id === srow.dataset.sid); const a = e.target.closest('[data-sact]')?.dataset.sact; if (!st || !a) return;
     undoStack.push({ type: 'strays', prev: JSON.parse(JSON.stringify(S.strays)), logLen: S.log.length });
-    st.qty = Math.max(0, st.qty + (a === 'inc' ? 1 : -1)); st.parts = [st.qty]; st.notes = st.notes.filter(n => !/^Logged as /.test(n));
-    if (st.qty === 0) S.strays = S.strays.filter(x => x !== st); save(); renderAll(); return; }
+    st.qty = Math.max(0, st.qty + (a === 'inc' ? 1 : -1)); st.parts = [st.qty]; st.notes = st.notes.filter(n => !/^Logged as /.test(n)); st.at = new Date().toISOString();
+    if (st.qty === 0) { S.strays = S.strays.filter(x => x !== st); markLine('s:' + st.id, { gone: true, st: JSON.parse(JSON.stringify(st)) }); } else markLine('s:' + st.id);
+    save(); renderAll(); return; }
   const row = e.target.closest('.row'); if (!row) return;
   const i = +row.dataset.i; const act = e.target.closest('[data-act]')?.dataset.act;
   if (act === 'inc') { const c = S.counts[i]; applyCount(i, (c ? c.qty : 0) + 1, { mode: 'set', bin: S.bin && S.parts[i].bin && S.bin !== S.parts[i].bin ? S.bin : null }); renderAll(); return; }
   if (act === 'dec') { const c = S.counts[i]; applyCount(i, Math.max(0, (c ? c.qty : 1) - 1), { mode: 'set' }); renderAll(); return; }
   if (act === 'zero') { applyCount(i, 0, { mode: 'set', notFound: true }); renderAll(); return; }
-  if (act === 'clear') { undoStack.push({ type: 'count', i, prev: S.counts[i] ? JSON.parse(JSON.stringify(S.counts[i])) : null, logLen: S.log.length }); delete S.counts[i]; save(); renderAll(); return; }
+  if (act === 'clear') { undoStack.push({ type: 'count', i, prev: S.counts[i] ? JSON.parse(JSON.stringify(S.counts[i])) : null, logLen: S.log.length }); delete S.counts[i]; markLine('r:' + i); save(); renderAll(); return; }
   if (act === 'note') return;
   const tools = row.querySelector('.rowtools'); if (tools) tools.hidden = !tools.hidden;
 });
@@ -313,7 +514,7 @@ $('binsList').addEventListener('change', e => {
   if (e.target.dataset.act !== 'note') return;
   const i = +e.target.closest('.row').dataset.i;
   if (!S.counts[i]) applyCount(i, 0, { mode: 'set' });
-  S.counts[i].manualNote = e.target.value.trim(); save(); renderAll();
+  S.counts[i].manualNote = e.target.value.trim(); markLine('r:' + i); save(); renderAll();
 });
 
 /* pending events */
@@ -356,10 +557,12 @@ function openUnlisted(pre = {}, fromPending = null, editId = null) {
   $('sheet').hidden = false;
   $('uPhoto').onchange = async ev => { const f = ev.target.files[0]; if (!f) return; photo = await shrink(f); if (photo) { $('uPrev').src = photo; $('uPrev').hidden = false; } };
   $('uCancel').onclick = () => $('sheet').hidden = true;
-  if (u) $('uDel').onclick = () => { S.unlisted = S.unlisted.filter(x => x !== u); save(); $('sheet').hidden = true; renderAll(); };
+  if (u) $('uDel').onclick = () => { S.unlisted = S.unlisted.filter(x => x !== u); markLine('u:' + u.id, { gone: true, u: { ...u, photo: null } }); save(); $('sheet').hidden = true; renderAll(); };
   $('uSave').onclick = () => {
     const rec = { id: u ? u.id : 'u' + (S.seq++), pn: $('uPn').value.trim(), desc: $('uDesc').value.trim(), qty: +$('uQty').value || 0, bin: $('uBin').value.trim().toUpperCase(), notes: $('uNotes').value.trim(), photo };
+    rec.at = new Date().toISOString();
     if (u) Object.assign(u, rec); else S.unlisted.push(rec);
+    markLine('u:' + rec.id);
     if (fromPending) S.pending = S.pending.filter(p => p.id !== fromPending);
     logIt({ bin: rec.bin, raw: pre.desc, part: '(not in system) ' + rec.pn, qty: rec.qty, mode: 'unlisted', status: 'unlisted' });
     if (!save()) { rec.photo = null; save(); }
@@ -389,10 +592,6 @@ function computeRows() {
     return { p, i, counted, uncounted: !c, vq, vd: vq * (+p.cost || 0), notes: [...new Set(notes)].join('; ') };
   });
 }
-async function hashPin(pin) {
-  try { const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('shelfcount:' + pin)); return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join(''); }
-  catch { return 'plain:' + pin; }
-}
 function showReview() {
   $('vCount').hidden = true; $('composer').hidden = true; $('top').hidden = true; $('vReview').hidden = false; hideToast();
   const rows = computeRows();
@@ -401,7 +600,7 @@ function showReview() {
   const mins = Math.max(1, Math.round((Date.now() - new Date(S.startedAt)) / 60000));
   let html = `
     <div class="prow" style="justify-content:space-between"><h1>${esc(S.rack)} count</h1><button class="btn small" id="backBtn">Back to counting</button></div>
-    <p>${esc(S.counter)} · about ${mins} min · ${esc(S.whName)}</p>
+    <p>${esc(S.counter)} · ${esc(S.whName)} · started ${new Date(S.startedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })} · about ${mins} min · ${waitingCount() ? `<b style="color:var(--warn)">${waitingCount()} lines not on the server yet</b>` : 'all lines saved to the server'}</p>
     ${S.pending.length ? `<div class="callout" style="background:var(--bad-bg)"><b>${S.pending.length} unconfirmed card${S.pending.length > 1 ? 's' : ''}</b> won't be in the file until you confirm or discard them.</div>` : ''}
     <div class="stats">
       <div class="stat"><small>Lines counted</small><b class="num">${rows.length - unc.length}/${rows.length}</b></div>
@@ -414,28 +613,33 @@ function showReview() {
     <div class="prow"><button class="btn primary" id="blindBtn">Save count file</button><button class="btn" id="csvBtn">Save CSV</button>${S.unlisted.some(u => u.photo) ? '<button class="btn" id="photoBtn">Save photos</button>' : ''}</div>
     <div class="empty-note" id="saveMsg"></div>
     <div id="mgr" style="display:grid;gap:14px;border-top:1px solid var(--line);padding-top:14px"></div>
-    <div class="prow" style="border-top:1px solid var(--line);padding-top:14px"><button class="btn ghost" id="newBtn">Finish and start another rack</button></div>`;
+    <div class="prow" style="border-top:1px solid var(--line);padding-top:14px"><button class="btn primary" id="newBtn">Finish this count</button></div>`;
   $('reviewPanel').innerHTML = html;
   $('backBtn').onclick = showCount;
   $('blindBtn').onclick = () => saveFile(`${S.rack}_Count_${S.counter.replace(/\W+/g, '')}_${dateTag()}.xlsx`, buildXlsx(false));
   $('csvBtn').onclick = () => saveFile(`${S.rack}_Count_${dateTag()}.csv`, buildCsv());
   if ($('photoBtn')) $('photoBtn').onclick = savePhotos;
-  $('newBtn').onclick = () => { $('newBtn').outerHTML = `<span class="callout" style="width:100%">This clears the ${esc(S.rack)} count from this phone. Save the count file first. <button class="btn small" id="newYes" style="color:var(--bad)">Clear and pick a rack</button></span>`; $('newYes').onclick = () => { store.del(KEY); S = null; renderSetup(); window.scrollTo(0, 0); }; };
+  $('newBtn').onclick = () => {
+    $('newBtn').outerHTML = `<span class="callout" style="width:100%">Finishing sends every line to the server, with anything not counted saved as 0, "not found". <button class="btn small primary" id="newYes">Finish ${esc(S.rack)}</button></span>`;
+    $('newYes').onclick = async () => {
+      $('newYes').disabled = true; $('newYes').textContent = 'Saving…';
+      S.finishedAt = new Date().toISOString(); S.sessionDirty = true;
+      queueDirty({ finishing: true });
+      await flushSync();
+      const left = waitingCount();
+      store.del(KEY); S = null; renderSetup(); window.scrollTo(0, 0);
+      $('fileMsg').textContent = left ? `Count finished. ${left} line${left > 1 ? 's' : ''} will upload automatically when there’s signal. Keep this page open or reopen it later.` : 'Count finished and saved to the server.';
+    };
+  };
   renderManager();
   window.scrollTo(0, 0);
 }
 function renderManager() {
   const box = $('mgr');
+  if (!AUTH || !AUTH.manager) { box.innerHTML = '<h2>Manager view</h2><p>System quantities and variance are only shown to managers. Sign in as a manager to see them.</p>'; return; }
   if (!managerOpen) {
-    box.innerHTML = `<div class="prow" style="justify-content:space-between"><h2>Manager view</h2></div>
-      <p>${WH.pin ? 'System quantities and variance. Enter the manager PIN.' : 'System quantities and variance. No PIN is set on this phone yet, so set one now to keep counters blind.'}</p>
-      <div class="prow"><input class="qtyin" type="password" inputmode="numeric" id="pinIn" placeholder="PIN" style="width:120px;font-size:18px" autocomplete="off"><button class="btn" id="pinBtn">${WH.pin ? 'Unlock' : 'Set PIN and unlock'}</button><span class="empty-note" id="pinMsg"></span></div>`;
-    $('pinBtn').onclick = async () => {
-      const v = $('pinIn').value.trim(); if (v.length < 3) { $('pinMsg').textContent = 'Use at least 3 digits.'; return; }
-      const h = await hashPin(v);
-      if (!WH.pin) { WH.pin = h; store.set(WHKEY, WH); managerOpen = true; renderManager(); return; }
-      if (h === WH.pin) { managerOpen = true; renderManager(); } else { $('pinMsg').textContent = 'Wrong PIN.'; $('pinIn').value = ''; }
-    };
+    box.innerHTML = '<div class="prow" style="justify-content:space-between"><h2>Manager view</h2><button class="btn" id="unlockBtn">Show variance</button></div><p>Keeps the counter blind until you tap it.</p>';
+    $('unlockBtn').onclick = () => { managerOpen = true; renderManager(); };
     return;
   }
   const rows = computeRows();
@@ -608,7 +812,9 @@ $('micBtn').addEventListener('click', () => {
 
 /* boot */
 const saved = store.get(KEY);
-if (saved && saved.parts && saved.counter && saved.v === 2) { S = saved; setIndex(); showCount(); } else renderSetup();
+if (saved && saved.parts && saved.counter && saved.v === 2) { S = saved; upgradeSession(); setIndex(); showCount(); } else renderSetup();
+loadNames();
 wireCaps();
+flushSync();
 document.addEventListener('visibilitychange', () => { if (document.hidden) save(); });
 })();
