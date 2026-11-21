@@ -265,37 +265,96 @@ function upgradeSession() {
   if (!S.id) { S.id = uid(); S.sessionDirty = true; markAll(); }
   S.dirty = S.dirty || {}; if (S.whKey == null) S.whKey = WH.key;
 }
+const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, sept: 8, oct: 9, nov: 10, dec: 11 };
+// A date written in the sheet's title rows ("counted Nov 19, 2026" or 11/19/2026), else null
+function sheetDate(aoa, upto) {
+  const text = aoa.slice(0, Math.max(1, upto)).flat().filter(c => typeof c === 'string').join(' ');
+  let m = text.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sept?|oct|nov|dec)[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})\b/i);
+  if (m) return new Date(+m[3], MONTHS[m[1].toLowerCase()], +m[2]);
+  m = text.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b/);
+  return m ? new Date(+m[3], +m[1] - 1, +m[2]) : null;
+}
+const ymd = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const normId = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+const numOrNull = v => { if (v == null || v === '') return null; const n = parseFloat(String(v).replace(/[$,]/g, '')); return isNaN(n) ? null : n; };
+function readUpload(wb) {
+  const list = [], counted = []; let date = null;
+  for (const sn of wb.SheetNames) {
+    const sh = wb.Sheets[sn]; fixRange(sh);
+    const aoa = XLSX.utils.sheet_to_json(sh, { header: 1, raw: true, defval: null });
+    const hi = aoa.findIndex(r => r && r.some(c => /^part\s*id$/i.test(String(c || '').trim())));
+    if (hi < 0) continue;
+    const H = aoa[hi].map(c => String(c || '').trim().toLowerCase());
+    const col = (...names) => H.findIndex(h => names.includes(h));
+    const ci = { id: col('part id'), type: col('part type','type'), desc: col('description'), status: col('status'), loc: col('bin location','warehouse bin','bin','bin #','bin number','location'), wh: col('warehouse','inventory warehouse','warehouse name','warehouse id'), avail: col('available'), onHand: col('on hand','onhand','qty on hand','on hand (m+)'), cost: col('current cost','cost','unit cost'),
+      count: col('counted','count','physical count','counted qty'), notes: H.map((h, i) => ['notes','count notes','result','legend','count location'].includes(h) ? i : -1).filter(i => i >= 0) };
+    const takeCounts = ci.count >= 0 && !counted.length; // first counted sheet only: per-shelf tabs repeat the same lines
+    if (takeCounts) date = sheetDate(aoa, hi);
+    for (const r of aoa.slice(hi + 1)) {
+      const id = r[ci.id]; if (id == null || String(id).trim() === '') continue;
+      if (/^count:/i.test(String(id))) continue;
+      const onHand = ci.onHand >= 0 ? numOrNull(r[ci.onHand]) : null, desc = ci.desc >= 0 ? r[ci.desc] || '' : '';
+      if (onHand == null && !desc) continue; // legend / footnote rows
+      const row = { id: String(id).trim(), type: r[ci.type] || '', desc, status: r[ci.status] || '', loc: ci.loc >= 0 ? String(r[ci.loc] ?? '').trim() : '', wh: ci.wh >= 0 ? String(r[ci.wh] ?? '').trim() : '', avail: +r[ci.avail] || 0, onHand: onHand || 0, cost: ci.cost >= 0 ? numOrNull(r[ci.cost]) || 0 : 0 };
+      list.push(row);
+      if (takeCounts) { const q = numOrNull(r[ci.count]); if (q != null) counted.push({ ...row, onHandRaw: onHand, qty: q, notes: ci.notes.map(i => r[i]).filter(v => v != null && v !== '').join('; ') }); }
+    }
+  }
+  return { list, counted, date };
+}
 $('inFile').addEventListener('change', async e => {
-  const f = e.target.files[0]; if (!f) return;
-  if (!pickedWh) { $('fileMsg').textContent = 'Pick which warehouse this export is for first.'; e.target.value = ''; return; }
+  const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+  if (!pickedWh) { $('fileMsg').innerHTML = '<b style="color:var(--bad)">Pick which warehouse this file is for first, then upload again.</b>'; $('inWh').focus(); return; }
   $('fileMsg').textContent = 'Reading…';
   try {
-    const wb = XLSX.read(await f.arrayBuffer());
-    const rows = [];
-    for (const sn of wb.SheetNames) {
-      const sh = wb.Sheets[sn]; fixRange(sh);
-      const aoa = XLSX.utils.sheet_to_json(sh, { header: 1, raw: true, defval: null });
-      const hi = aoa.findIndex(r => r && r.some(c => /^part\s*id$/i.test(String(c || '').trim())));
-      if (hi < 0) continue;
-      const H = aoa[hi].map(c => String(c || '').trim().toLowerCase());
-      const col = (...names) => H.findIndex(h => names.includes(h));
-      const ci = { id: col('part id'), type: col('part type','type'), desc: col('description'), status: col('status'), loc: col('bin location','warehouse bin','bin','bin #','bin number','location'), wh: col('warehouse','inventory warehouse','warehouse name','warehouse id'), avail: col('available'), onHand: col('on hand','onhand','qty on hand'), cost: col('current cost','cost','unit cost') };
-      for (const r of aoa.slice(hi + 1)) {
-        const id = r[ci.id]; if (id == null || String(id).trim() === '') continue;
-        if (/^count:/i.test(String(id))) continue;
-        const cost = ci.cost >= 0 ? parseFloat(String(r[ci.cost] ?? '0').replace(/[$,]/g, '')) || 0 : 0;
-        rows.push({ id: String(id).trim(), type: r[ci.type] || '', desc: r[ci.desc] || '', status: r[ci.status] || '', loc: ci.loc >= 0 ? String(r[ci.loc] ?? '').trim() : '', wh: ci.wh >= 0 ? String(r[ci.wh] ?? '').trim() : '', avail: +r[ci.avail] || 0, onHand: +r[ci.onHand] || 0, cost });
-      }
-    }
-    if (!rows.length) throw new Error('No sheet with a "Part ID" header and part rows');
+    const { list, counted, date } = readUpload(XLSX.read(await f.arrayBuffer()));
+    if (!list.length) throw new Error('no sheet with a "Part ID" header and part rows');
+    if (counted.length) { openCountImport(f, counted, date || new Date(f.lastModified || Date.now())); $('fileMsg').textContent = ''; return; }
     const wn = whName(pickedWh) || f.name.replace(/\.(xlsx|xls|csv)$/i, '');
-    WH = { key: pickedWh, name: wn, file: f.name, source: 'file', loadedAt: new Date().toISOString(), rows: prepRows(rows, wn), builtin: false };
+    WH = { key: pickedWh, name: wn, file: f.name, source: 'file', loadedAt: new Date().toISOString(), rows: prepRows(list, wn), builtin: false };
     const ok = store.set(WHKEY, WH);
-    $('fileMsg').textContent = `Loaded ${rows.length} lines.${ok ? '' : ' (Too big to keep on this phone; re-upload if you close the page.)'}`;
+    $('fileMsg').textContent = `Loaded ${list.length} parts to count against.${ok ? '' : ' (Too big to keep on this phone; re-upload if you close the page.)'}`;
     pickedRack = null; renderSetup();
   } catch (err) { $('fileMsg').textContent = 'Could not read that file: ' + err.message + '.'; }
-  e.target.value = '';
 });
+// A sheet that already has counts in it: save it as a finished, dated count (no recounting)
+function openCountImport(f, counted, guessDate) {
+  const wn = whName(pickedWh);
+  const areas = [...new Set(counted.map(r => splitLoc(r.loc, wn).rack))];
+  $('sheetPanel').innerHTML = `<h2>Save a count that's already done</h2>
+    <p><b>${esc(f.name)}</b> has ${counted.length} counted line${counted.length > 1 ? 's' : ''} for <b>${esc(wn)}</b>. It's saved as a finished count, the same as one done in the app. Check the date: anything used after it can then be traced.</p>
+    <div class="prow"><div class="field"><label for="ciDate">Count date</label><input type="date" id="ciDate" class="sel" value="${ymd(guessDate)}"></div>
+      <div class="field"><label for="ciArea">Rack / area</label><input type="text" id="ciArea" value="${esc(areas.length === 1 ? areas[0] : areas.join(', '))}"></div></div>
+    <div class="empty-note" id="ciMsg"></div>
+    <div class="prow"><button class="btn primary" id="ciSave">Save count</button><button class="btn" id="ciCancel">Cancel</button></div>`;
+  $('sheet').hidden = false;
+  $('ciCancel').onclick = () => { $('sheet').hidden = true; };
+  $('ciSave').onclick = async () => {
+    const day = $('ciDate').value; if (!day) { $('ciMsg').textContent = 'Pick the date it was counted.'; return; }
+    $('ciSave').disabled = true; $('ciMsg').textContent = 'Matching to ManagerPlus…';
+    try {
+      let sys = listForPicked() && WH.source === 'live' ? WH.rows : null;
+      if (!sys) { const r = await api('load', { warehouseKey: pickedWh }, 120000); if (!r.ok) throw new Error(r.error); sys = r.parts; }
+      const byId = new Map(sys.map(p => [normId(p.id), p]));
+      const sid = 'import-' + f.name.toLowerCase().replace(/\.(xlsx|xls|csv)$/, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+      const at = new Date(day + 'T12:00:00').toISOString(), area = $('ciArea').value.trim() || wn, seen = {};
+      const lines = counted.map(r => {
+        const p = byId.get(normId(r.id)); let key = `${p ? 'r' : 'u'}:${p ? p.key : normId(r.id)}`;
+        seen[key] = (seen[key] || 0) + 1; if (seen[key] > 1) key += '-' + seen[key];
+        return { id: `${sid}:${key}`, area, partKey: p ? p.key : null, partId: r.id, desc: r.desc || (p ? p.desc : ''), systemBin: r.loc || (p ? p.loc : '') || '', foundBin: r.loc || area,
+          qty: r.qty, systemOnHand: r.onHandRaw, cost: r.cost || (p ? p.cost : null), countedAt: at, counter: AUTH.name, status: p ? 'imported' : 'not_in_system', unlisted: !p, notes: r.notes, source: 'import' };
+      });
+      const session = { id: sid, warehouseKey: pickedWh, warehouseName: wn, area, counter: AUTH.name, startedAt: at, finishedAt: at, source: 'import', lineCount: lines.length, notes: `Uploaded from ${f.name}` };
+      $('ciMsg').textContent = 'Saving…';
+      const res = await api('save', { session, lines }, 90000);
+      if (!res.ok) throw new Error(res.error || 'save failed');
+      const miss = lines.filter(l => l.unlisted).length;
+      $('sheet').hidden = true;
+      $('fileMsg').textContent = `Saved ${lines.length} counted lines from ${f.name} as the ${new Date(at).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })} count.${miss ? ` ${miss} didn't match a ManagerPlus part and are marked "not in system".` : ''}`;
+      renderPast(true);
+    } catch (err) { $('ciMsg').textContent = 'Could not save: ' + (err.message || 'no signal') + '.'; $('ciSave').disabled = false; }
+  };
+}
 
 /* ---------------- counting ---------------- */
 function showCount() {
@@ -809,6 +868,19 @@ $('micBtn').addEventListener('click', () => {
   micBase = $('say').value.trim();
   dict.start({ language: 'en-US' }).catch(e => { if (e && e.code === 'not_granted') $('micBtn').hidden = true; });
 });
+
+/* theme: Auto follows the phone; Light / Dark stick on this phone */
+const THEMES = ['auto', 'dark', 'light'], THEME_LABEL = { auto: '◐ Auto', dark: '☾ Dark', light: '☀ Light' };
+function applyTheme(t) {
+  if (t === 'auto') document.documentElement.removeAttribute('data-theme'); else document.documentElement.setAttribute('data-theme', t);
+  const dark = t === 'dark' || (t === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', dark ? '#152027' : '#0E5E6E');
+  document.querySelectorAll('.themeBtn').forEach(b => { b.textContent = THEME_LABEL[t]; b.title = 'Theme: ' + t + ' (tap to change)'; });
+}
+let theme = store.get('shelfcount.theme') || 'auto';
+applyTheme(theme);
+document.querySelectorAll('.themeBtn').forEach(b => b.addEventListener('click', () => { theme = THEMES[(THEMES.indexOf(theme) + 1) % 3]; store.set('shelfcount.theme', theme); applyTheme(theme); }));
+matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', () => applyTheme(theme));
 
 /* boot */
 const saved = store.get(KEY);
