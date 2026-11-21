@@ -53,7 +53,7 @@ let data = body;
 if (typeof body.payload === 'string') { try { data = JSON.parse(body.payload); } catch (e) { data = {}; } }
 const fail = (error) => [{ json: { route: 0, reply: { ok: false, error } } }];
 
-const routes = { names: 0, login: 0, load: 1, save: 2, sessions: 3, session: 4 };
+const routes = { names: 0, login: 0, load: 1, save: 2, sessions: 3, session: 4, reconcile: 5, actions: 6, setAction: 7 };
 const action = String(data.action || '');
 if (!(action in routes)) return fail('Unknown request.');
 if (action === 'names') return [{ json: { route: 0, reply: { ok: true, people: people.map((p) => p.name), problems } } }];
@@ -84,4 +84,6 @@ if (action === 'save') {
   if (data.lines.length > 2000) return fail('Too many lines in one save.');
 }
 if (action === 'session' && !data.sessionId) return fail('Which session?');
-return [{ json: { route: routes[action], action, user: who.name, manager: who.manager, warehouse: wh || null, data } }];
+if (['reconcile', 'actions', 'setAction'].includes(action) && !who.manager) return fail('Only managers can see reconcile.');
+if (action === 'setAction' && (!data.actionId || !['open', 'approved', 'dismissed', 'done'].includes(data.status))) return fail('Bad action update.');
+return [{ json: { route: routes[action], action, user: who.name, manager: who.manager, warehouse: wh || null, warehouses, data } }];

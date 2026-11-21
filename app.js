@@ -203,8 +203,9 @@ $('pastList').addEventListener('click', async e => {
   try { await resumeFromServer(b.dataset.resume); } catch (err) { b.textContent = 'Failed'; $('fileMsg').textContent = 'Could not continue that count: ' + err.message; }
 });
 function renderSetup() {
-  $('top').hidden = true; $('composer').hidden = true; $('vCount').hidden = true; $('vReview').hidden = true; $('vSetup').hidden = false;
+  $('top').hidden = true; $('composer').hidden = true; $('vCount').hidden = true; $('vReview').hidden = true; $('vRecon').hidden = true; $('vSetup').hidden = false;
   renderAuth();
+  $('reconEntry').hidden = !(AUTH && AUTH.manager);
   const saved = store.get(KEY);
   $('resumeBtn').hidden = !(saved && saved.parts);
   if (saved && saved.parts) $('resumeBtn').textContent = `Resume ${saved.rack} (${Object.keys(saved.counts).length} of ${saved.parts.length} lines)`;
@@ -867,6 +868,95 @@ $('micBtn').addEventListener('click', () => {
   if (dict.active()) { dict.stop().catch(() => {}); return; }
   micBase = $('say').value.trim();
   dict.start({ language: 'en-US' }).catch(e => { if (e && e.code === 'not_granted') $('micBtn').hidden = true; });
+});
+
+/* ---------------- reconcile board (managers) ---------------- */
+const RTYPES = [
+  ['adjust_qty', 'Adjust quantity'], ['transfer', 'Transfers'], ['bin_move', 'Wrong shelf'], ['check_elsewhere', 'Look elsewhere first'],
+  ['assign_bin', 'Assign a bin'], ['part_id_fix', 'Part # mix-ups'], ['new_part', 'Not in ManagerPlus'], ['resolved', 'Explained by work orders'],
+];
+let RC = { actions: [], tab: 'adjust_qty' };
+function showRecon() {
+  $('vSetup').hidden = true; $('vCount').hidden = true; $('vReview').hidden = true; $('top').hidden = true; $('composer').hidden = true; $('vRecon').hidden = false;
+  window.scrollTo(0, 0); loadRecon(false);
+}
+$('openRecon').addEventListener('click', showRecon);
+$('reconBack').addEventListener('click', () => { renderSetup(); });
+$('reconGo').addEventListener('click', () => loadRecon(true));
+$('reconStatus').addEventListener('change', renderRecon);
+$('reconWh').addEventListener('change', renderRecon);
+$('reconTabs').addEventListener('click', e => { const t = e.target.closest('[data-tab]'); if (!t) return; RC.tab = t.dataset.tab; renderRecon(); });
+async function loadRecon(run) {
+  $('reconMsg').textContent = run ? 'Checking every count against ManagerPlus, work orders and POs… (about 20 seconds)' : 'Loading…';
+  $('reconGo').disabled = true;
+  try {
+    const r = await api(run ? 'reconcile' : 'actions', {}, 300000);
+    if (!r.ok) throw new Error(r.error);
+    RC.actions = r.actions || [];
+    $('reconMsg').textContent = run ? 'Done.' : '';
+    if (!run && !RC.actions.length) $('reconMsg').textContent = 'No reconcile run yet. Tap Run reconcile now.';
+  } catch (err) { $('reconMsg').textContent = 'Could not load: ' + (err.name === 'AbortError' ? 'it took too long.' : err.message); }
+  $('reconGo').disabled = false; renderRecon();
+}
+const statusOk = a => { const f = $('reconStatus').value; return f === 'all' || (a.status || 'open') === f; };
+function renderRecon() {
+  const run = RC.actions.find(a => a.action_id === 'run|last');
+  $('reconRun').textContent = run ? `Last run ${new Date(run.run_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}. ${run.summary}` : 'Not run yet.';
+  const acts = RC.actions.filter(a => a.type !== 'run');
+  const whs = [...new Set(acts.map(a => a.warehouse_name).filter(Boolean))].sort();
+  const curWh = $('reconWh').value;
+  $('reconWh').innerHTML = '<option value="">All</option>' + whs.map(w => `<option ${w === curWh ? 'selected' : ''}>${esc(w)}</option>`).join('');
+  const shown = acts.filter(a => statusOk(a) && (!curWh || a.warehouse_name === curWh || String(a.to_loc).startsWith(curWh) || String(a.from_loc).startsWith(curWh)));
+  const open = acts.filter(a => (a.status || 'open') === 'open' && a.type !== 'resolved');
+  const sumAbs = l => l.reduce((n, a) => n + Math.abs(+a.value || 0), 0);
+  const short = open.filter(a => a.type === 'adjust_qty' && a.qty < 0), over = open.filter(a => a.type === 'adjust_qty' && a.qty > 0);
+  $('reconStats').innerHTML = `
+    <div class="stat"><small>Open actions</small><b class="num">${open.length}</b></div>
+    <div class="stat neg"><small>Still short</small><b class="num">${money(-sumAbs(short))}</b></div>
+    <div class="stat pos"><small>Still over</small><b class="num">${money(sumAbs(over))}</b></div>
+    <div class="stat"><small>Moves &amp; transfers</small><b class="num">${open.filter(a => /transfer|bin_move|assign_bin/.test(a.type)).length}</b></div>`;
+  $('reconTabs').innerHTML = RTYPES.map(([t, label]) => { const n = shown.filter(a => a.type === t).length; return `<button class="tab ${RC.tab === t ? 'on' : ''}" data-tab="${t}" role="tab" aria-selected="${RC.tab === t}">${label}<small>${n}</small></button>`; }).join('');
+  const list = shown.filter(a => a.type === RC.tab).sort((a, b) => Math.abs(+b.value || 0) - Math.abs(+a.value || 0));
+  $('reconList').innerHTML = list.length ? list.map(actHTML).join('') : '<span class="empty-note">Nothing here for this filter.</span>';
+}
+function actHTML(a) {
+  let ev = []; try { const d = JSON.parse(a.detail || '{}'); ev = d.evidence || []; } catch {}
+  const st = a.status || 'open';
+  const where = a.type === 'adjust_qty' ? `${esc(a.warehouse_name)} · ManagerPlus <strong>${esc(a.from_loc)}</strong> → <strong>${esc(a.to_loc)}</strong>`
+    : a.type === 'part_id_fix' ? `${esc(a.warehouse_name)} · counted as <strong>${esc(a.from_loc)}</strong>`
+    : a.type === 'new_part' ? `${esc(a.warehouse_name)} · found on <strong>${esc(a.to_loc)}</strong>`
+    : `<strong>${esc(a.from_loc)}</strong> → <strong>${esc(a.to_loc)}</strong>`;
+  const btns = st === 'open' ? `<button class="btn small primary" data-set="approved">Approve</button><button class="btn small" data-set="done">Done in ManagerPlus</button><button class="btn small ghost" data-set="dismissed">Dismiss</button>`
+    : `<button class="btn small" data-set="${st === 'approved' ? 'done' : 'open'}">${st === 'approved' ? 'Mark done in ManagerPlus' : 'Reopen'}</button>`;
+  return `<div class="act t-${a.type}" data-aid="${esc(a.action_id)}">
+    <div class="head"><b>${esc(a.part_id)}</b><span class="pill ${st}">${st}</span>${a.qty != null && a.type !== 'resolved' ? `<span class="num">qty ${a.qty > 0 && a.type === 'adjust_qty' ? '+' : ''}${a.qty}</span>` : ''}<span class="val num">${a.value ? money(+a.value) : ''}</span></div>
+    <div class="where">${esc(a.description || '')}</div>
+    <div class="where">${where}${a.counted_at ? ` · counted ${new Date(a.counted_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}` : ''}</div>
+    <div class="sum">${esc(a.summary)}</div>
+    ${ev.length ? `<div class="ev">${ev.map(esc).join(' · ')}</div>` : ''}
+    ${a.type === 'resolved' ? '' : `<div class="prow">${btns}${a.updated_by ? `<span class="empty-note">${esc(a.updated_by)}, ${new Date(a.updated_at).toLocaleDateString()}</span>` : ''}</div>`}
+  </div>`;
+}
+$('reconList').addEventListener('click', async e => {
+  const b = e.target.closest('[data-set]'); if (!b) return;
+  const card = b.closest('[data-aid]'); const a = RC.actions.find(x => x.action_id === card.dataset.aid); if (!a) return;
+  b.disabled = true;
+  try {
+    const r = await api('setAction', { actionId: a.action_id, status: b.dataset.set }, 30000);
+    if (!r.ok) throw new Error(r.error);
+    a.status = b.dataset.set; a.updated_by = AUTH.name; a.updated_at = new Date().toISOString(); renderRecon();
+  } catch (err) { b.disabled = false; $('reconMsg').textContent = 'Could not update: ' + err.message; }
+});
+$('reconExport').addEventListener('click', () => {
+  const label = Object.fromEntries(RTYPES);
+  const rows = RC.actions.filter(a => a.type !== 'run' && a.type !== 'resolved' && /open|approved/.test(a.status || 'open'))
+    .sort((a, b) => (a.type > b.type ? 1 : a.type < b.type ? -1 : Math.abs(b.value) - Math.abs(a.value)))
+    .map(a => ({ Status: a.status, Action: label[a.type] || a.type, 'Part ID': a.part_id, Description: a.description, Warehouse: a.warehouse_name, From: a.from_loc, To: a.to_loc, Qty: a.qty, 'Value ($)': +a.value || 0, 'Counted': a.counted_at ? String(a.counted_at).slice(0, 10) : '', 'What to do': a.summary,
+      Evidence: (() => { try { return (JSON.parse(a.detail || '{}').evidence || []).join('; '); } catch { return ''; } })() }));
+  const ws = XLSX.utils.json_to_sheet(rows); ws['!cols'] = [10, 20, 22, 36, 22, 22, 22, 6, 11, 11, 80, 50].map(w => ({ wch: w }));
+  if (rows.length) ws['!autofilter'] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rows.length, c: 11 } }) };
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Reconcile actions');
+  saveFile(`Reconcile_actions_${dateTag()}.xlsx`, new Uint8Array(XLSX.write(wb, { type: 'array', bookType: 'xlsx' })), 'reconMsg');
 });
 
 /* theme: Auto follows the phone; Light / Dark stick on this phone */

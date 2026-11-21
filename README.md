@@ -35,6 +35,27 @@ It's a static site with no build step. Vercel serves it as-is (Framework preset:
 
 People, PINs and the warehouse list live in the workflow's **Gatekeeper** node (edit the block at the top). Put `| manager` after a PIN to let that person see variances.
 
+## Reconcile (managers)
+
+**Open reconcile board** on the start screen (managers only). **Run reconcile now** makes n8n:
+
+1. take the newest count of every rack/area in every warehouse,
+2. pull current ManagerPlus stock for all warehouses, the work-order parts used on counted parts, the work orders since the first count (for dates), and recent POs,
+3. sort every difference into one action:
+
+| Action | Meaning |
+|---|---|
+| Adjust quantity | Counted vs system at count time, minus parts used and plus parts received since that count date. Shows what ManagerPlus should be now. |
+| Transfers | Extra in one warehouse, short in another: record a transfer instead of two adjustments. |
+| Wrong shelf | Found on a different bin than ManagerPlus says (including old "found on shelf H" notes). |
+| Look elsewhere first | Short here, but ManagerPlus shows stock in a warehouse/bin nobody has counted yet. |
+| Assign a bin | Found on a shelf, no bin in ManagerPlus. |
+| Part # mix-ups | Counted number is a near-miss of a real part number (0/O, 5/S…). |
+| Not in ManagerPlus | On the shelf, no similar part number at all. |
+| Explained by work orders | The shortage was a part pulled before the count whose work order was entered after; nothing to adjust. |
+
+Approve / Done in ManagerPlus / Dismiss are saved in the `recon_actions` table and kept across re-runs. **Save action list** exports open and approved actions to Excel. Nothing is written to ManagerPlus. The engine's source is `n8n/recon_core.js`.
+
 ## Locations without bins
 
 Service warehouses and vans often have no bin, and ManagerPlus leaves `Bin Location` blank. That's fine:
