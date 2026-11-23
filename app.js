@@ -58,22 +58,26 @@ function save() { if (!S) return true; const ok = store.set(KEY, S); scheduleSyn
    flushSync() sends the outbox to n8n. Line ids are stable, so re-sending a line updates it. */
 const OUTKEY = 'shelfcount.outbox.v1';
 let OUT = store.get(OUTKEY) || {}; let syncT = 0, syncing = false, syncErr = '';
-const foundAt = bin => bin ? `\\${S.rack}\\${bin}` : S.rack;
+const isQuick = () => S && S.mode === 'quick';
+const realRack = r => !!r && (WH.rows.some(p => p.rack === r && !p.noBin) || !WH.rows.some(p => p.rack === r));
+const foundAt = (bin, rack = S.rack) => !rack ? '' : bin ? `\\${rack}\\${bin}` : realRack(rack) ? `\\${rack}` : rack;
 function markLine(ref, snap) { if (!S) return; S.dirty = S.dirty || {}; S.dirty[ref] = snap || 1; }
 function markAll() { if (S) S.sessionDirty = true; }
 function sessionMeta(extra = {}) {
   const lineCount = Object.keys(S.counts).length + S.strays.length + S.unlisted.length;
-  return { id: S.id, warehouseKey: S.whKey, warehouseName: S.whName, area: S.rack, counter: S.counter, startedAt: S.startedAt, finishedAt: S.finishedAt || null, source: 'app', lineCount, notes: `list loaded ${S.listLoadedAt || '?'} from ${S.whFile || '?'}`, ...extra };
+  // a quick count is saved as finished from its first line: what it counts counts right away, and it never zeroes anything
+  const quick = isQuick();
+  return { id: S.id, warehouseKey: S.whKey, warehouseName: S.whName, area: quick ? 'Quick count' : S.rack, counter: S.counter, startedAt: S.startedAt, finishedAt: S.finishedAt || (quick ? S.startedAt : null), source: quick ? 'quick' : 'app', lineCount, notes: `${quick ? 'Quick count (only what was counted). ' : ''}list loaded ${S.listLoadedAt || '?'} from ${S.whFile || '?'}`, ...extra };
 }
 function lineFor(ref, snap, opts = {}) {
   const [kind, k] = [ref.slice(0, 1), ref.slice(2)];
-  const base = { area: S.rack, counter: S.counter, source: 'app' };
+  const base = { area: S.rack, counter: S.counter, source: isQuick() ? 'quick' : 'app' };
   if (kind === 'r') {
     const p = S.parts[+k]; if (!p) return null; const c = S.counts[+k];
     const line = { ...base, id: `${S.id}:r:${p.key ?? p.id}`, partKey: p.key ?? null, partId: p.id, desc: p.desc, systemBin: p.loc || '', systemOnHand: +p.onHand || 0, cost: +p.cost || 0 };
     if (!c) return opts.finishing ? { ...line, qty: 0, foundBin: '', countedAt: new Date().toISOString(), status: 'not_counted', notes: 'Not found in count - verify' }
       : { ...line, qty: null, foundBin: '', countedAt: new Date().toISOString(), status: 'cleared' };
-    return { ...line, qty: c.qty, foundBin: foundAt(c.foundBin || p.bin), countedAt: c.at || new Date().toISOString(), heard: (c.heard || []).join(' | '), status: c.status || 'manual', confidence: c.conf != null ? Math.round(Math.min(1, c.conf) * 100) : null, notes: [...c.notes, c.manualNote].filter(Boolean).join('; ') };
+    return { ...line, area: c.rack || S.rack, qty: c.qty, foundBin: c.loc || foundAt(c.foundBin || p.bin), countedAt: c.at || new Date().toISOString(), heard: (c.heard || []).join(' | '), status: c.status || 'manual', confidence: c.conf != null ? Math.round(Math.min(1, c.conf) * 100) : null, notes: [...c.notes, c.manualNote].filter(Boolean).join('; ') };
   }
   if (kind === 's') {
     const st = S.strays.find(x => x.id === k) || (snap && snap.gone ? { ...snap.st, qty: 0, removed: true } : null); if (!st) return null;
@@ -81,13 +85,13 @@ function lineFor(ref, snap, opts = {}) {
   }
   if (kind === 'u') {
     const u = S.unlisted.find(x => x.id === k) || (snap && snap.gone ? { ...snap.u, deleted: true } : null); if (!u) return null;
-    return { ...base, id: `${S.id}:u:${u.id}`, partKey: null, partId: u.pn, desc: u.desc, systemBin: '', systemOnHand: null, cost: null, qty: u.deleted ? 0 : u.qty, foundBin: foundAt(u.bin), countedAt: u.at || new Date().toISOString(), status: u.deleted ? 'deleted' : 'not_in_system', unlisted: true, notes: [u.notes, u.photo ? 'photo on counter’s phone' : ''].filter(Boolean).join('; ') };
+    return { ...base, id: `${S.id}:u:${u.id}`, partKey: null, partId: u.pn, desc: u.desc, systemBin: '', systemOnHand: null, cost: null, qty: u.deleted ? 0 : u.qty, foundBin: u.loc || foundAt(u.bin), countedAt: u.at || new Date().toISOString(), status: u.deleted ? 'deleted' : 'not_in_system', unlisted: true, notes: [u.notes, u.photo ? 'photo on counter’s phone' : ''].filter(Boolean).join('; ') };
   }
   return null;
 }
 function queueDirty(opts = {}) {
   if (!S || !S.id) return;
-  const refs = opts.finishing ? [...S.parts.map((_, i) => 'r:' + i), ...Object.keys(S.dirty || {}).filter(r => r[0] !== 'r')] : Object.keys(S.dirty || {});
+  const refs = opts.finishing && !isQuick() ? [...S.parts.map((_, i) => 'r:' + i), ...Object.keys(S.dirty || {}).filter(r => r[0] !== 'r')] : Object.keys(S.dirty || {});
   if (!refs.length && !S.sessionDirty && !opts.finishing) return;
   const box = OUT[S.id] = OUT[S.id] || { lines: {} };
   box.session = sessionMeta();
@@ -130,7 +134,7 @@ setInterval(() => { if (waitingCount()) flushSync(); }, 30000);
 window.addEventListener('online', flushSync);
 function setIndex() {
   index = Matcher.buildIndex(S.parts);
-  whOthers = WH.rows.filter(r => r.rack !== S.rack);
+  whOthers = isQuick() ? [] : WH.rows.filter(r => r.rack !== S.rack);
   whIndex = null; // built lazily: only needed when a part isn't on this rack
 }
 function getWhIndex() { if (!whIndex) whIndex = Matcher.buildIndex(whOthers); return whIndex; }
@@ -208,10 +212,10 @@ function renderSetup() {
   $('reconEntry').hidden = !(AUTH && AUTH.manager);
   const saved = store.get(KEY);
   $('resumeBtn').hidden = !(saved && saved.parts);
-  if (saved && saved.parts) $('resumeBtn').textContent = `Resume ${saved.rack} (${Object.keys(saved.counts).length} of ${saved.parts.length} lines)`;
+  if (saved && saved.parts) $('resumeBtn').textContent = saved.mode === 'quick' ? `Resume quick count (${Object.keys(saved.counts).length + saved.unlisted.length} counted)` : `Resume ${saved.rack} (${Object.keys(saved.counts).length} of ${saved.parts.length} lines)`;
   const rk = listForPicked() ? racks() : [];
   if (!rk.length) $('loadBtn').textContent = 'Load from ManagerPlus';
-  $('startBtn').disabled = !rk.length || !AUTH;
+  $('startBtn').disabled = !rk.length || !AUTH; $('quickBtn').disabled = !rk.length || !AUTH;
   renderPast();
   if (!rk.length) {
     $('whBox').innerHTML = !AUTH ? '<b>Sign in first</b><span>Your name and PIN are the same as the Parts Receiving app.</span>' : !pickedWh ? '<b>Pick a warehouse</b><span>Then load its parts list live from ManagerPlus.</span>' : `<b>${esc(whName(pickedWh))}</b><span>Not loaded on this phone yet. Tap Load from ManagerPlus.</span>`;
@@ -228,16 +232,29 @@ $('startBtn').addEventListener('click', () => {
   if (!AUTH) return;
   const name = AUTH.name;
   if (!pickedRack) return;
-  const saved = store.get(KEY);
-  if (saved && saved.parts && Object.keys(saved.counts).length && !$('startBtn').dataset.confirm) {
-    $('startBtn').dataset.confirm = '1'; $('startBtn').textContent = `Discard saved ${saved.rack} count and start ${pickedRack}?`; return;
-  }
-  delete $('startBtn').dataset.confirm; $('startBtn').textContent = 'Start counting';
+  if (!okToReplaceSaved($('startBtn'), `Start ${pickedRack}`)) return;
   S = newSession(name, pickedRack);
   setIndex(); markAll(); save(); showCount(); flushSync();
 });
-function newSession(name, rack, id) {
-  return { v: 2, id: id || uid(), counter: name, rack, whKey: WH.key, whName: WH.name, whFile: WH.file, listLoadedAt: WH.loadedAt, parts: WH.rows.filter(r => r.rack === rack).map(r => ({ ...r })), counts: {}, pending: [], unlisted: [], strays: [], log: [], bin: null, startedAt: new Date().toISOString(), seq: 1, dirty: {}, sessionDirty: true, lastSync: null };
+$('quickBtn').addEventListener('click', () => {
+  if (!AUTH || !listForPicked()) return;
+  if (!okToReplaceSaved($('quickBtn'), 'Quick count')) return;
+  S = newSession(AUTH.name, pickedRack || '', null, 'quick');
+  setIndex(); markAll(); save(); showCount(); flushSync();
+});
+// A paused full count on this phone is never thrown away: its lines are on the server and it can be continued
+// from "Counts in this warehouse". Ask once before this phone switches to a different count.
+function okToReplaceSaved(btn, label) {
+  const saved = store.get(KEY);
+  if (!(saved && saved.parts && (Object.keys(saved.counts).length || saved.unlisted.length || saved.strays.length))) return true;
+  if (btn.dataset.confirm) { delete btn.dataset.confirm; btn.textContent = label === 'Quick count' ? 'Quick count' : 'Start counting'; return true; }
+  btn.dataset.confirm = '1';
+  btn.textContent = saved.mode === 'quick' ? `Close the quick count and start? (it's all saved)` : `Pause ${saved.rack} and start? (continue it later from Counts below)`;
+  return false;
+}
+function newSession(name, rack, id, mode) {
+  const quick = mode === 'quick';
+  return { v: 2, id: id || uid(), mode: quick ? 'quick' : 'full', counter: name, rack, whKey: WH.key, whName: WH.name, whFile: WH.file, listLoadedAt: WH.loadedAt, parts: (quick ? WH.rows : WH.rows.filter(r => r.rack === rack)).map(r => ({ ...r })), counts: {}, pending: [], unlisted: [], strays: [], log: [], bin: null, startedAt: new Date().toISOString(), seq: 1, dirty: {}, sessionDirty: true, lastSync: null };
 }
 $('resumeBtn').addEventListener('click', () => { S = store.get(KEY); if (AUTH) S.counter = S.counter || AUTH.name; upgradeSession(); setIndex(); showCount(); flushSync(); });
 // Continue an open count started on another phone (or after this phone was wiped)
@@ -364,6 +381,8 @@ function showCount() {
 }
 function binsInOrder() { return [...new Set(S.parts.map(p => p.bin))].sort(); }
 function renderHeader() {
+  $('pauseBtn').hidden = isQuick(); $('toReview').textContent = isQuick() ? 'Done' : 'Review';
+  if (isQuick()) return renderQuickHeader();
   const n = S.parts.length, c = Object.keys(S.counts).length;
   $('hShelf').textContent = S.rack;
   $('hMeta').innerHTML = `${esc(S.counter)} · <span class="num">${c}/${n}</span> lines${S.pending.length ? ` · <b style="color:var(--warn)">${S.pending.length} to confirm</b>` : ''}`;
@@ -376,6 +395,7 @@ function renderHeader() {
   $('binHint').textContent = !hasShelves() ? 'No bins here. Just say part and count.' : S.bin ? `Shelf ${S.bin}: new lines log here` : 'Shelf: none set. Say “shelf A”';
 }
 function renderBins() {
+  if (isQuick()) return renderQuickRows();
   S.parts.forEach((p, i) => p._i = i);
   $('binsList').innerHTML = binsInOrder().map(b => {
     const ps = S.parts.filter(p => p.bin === b);
@@ -386,12 +406,35 @@ function renderBins() {
   }).join('') + (S.strays.length ? `<div class="bin"><div class="binhead"><span class="tag" style="background:var(--warn-bg);color:var(--warn)">From other racks</span><span class="cnt">system says these live elsewhere</span></div>
       <div class="rows">${S.strays.map(strayHTML).join('')}</div></div>` : '');
 }
+function quickRacks() { return [...new Set(WH.rows.filter(p => !p.noBin).map(p => p.rack))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })); }
+function renderQuickHeader() {
+  const n = Object.keys(S.counts).length + S.unlisted.length;
+  const here = foundAt(S.bin, S.rack) || 'location not set';
+  $('hShelf').textContent = S.rack ? `${S.rack}${S.bin ? ' ' + S.bin : ''}` : 'Quick';
+  $('hMeta').innerHTML = `Quick count · <span class="num">${n}</span> counted${S.pending.length ? ` · <b style="color:var(--warn)">${S.pending.length} to confirm</b>` : ''}`;
+  $('hBar').style.width = '0%';
+  const bins = [...new Set(WH.rows.filter(p => p.rack === S.rack && p.bin).map(p => p.bin))].sort();
+  const letters = bins.length ? bins : 'ABCDEFGHIJKL'.split('');
+  $('hBins').hidden = false;
+  $('hBins').innerHTML = quickRacks().map(r => `<button class="binchip ${S.rack === r ? 'on' : ''}" data-qr="${esc(r)}" style="font-size:15px">${esc(r)}</button>`).join('')
+    + `<button class="binchip" data-qr="?" style="font-size:15px" aria-label="Type a location">+ other</button><span style="flex:none;width:10px"></span>`
+    + (S.rack ? letters.map(b => `<button class="binchip ${S.bin === b ? 'on' : ''}" data-b="${b}" aria-label="Shelf ${b}">${b}</button>`).join('') : '');
+  $('binHint').textContent = S.rack ? `Counting at ${here}. Only what you count is saved.` : 'Pick the rack (or say “rack CI8 shelf D”), then part and count.';
+  requestAnimationFrame(() => { const on = $('hBins').querySelector(`[data-qr="${CSS.escape(S.rack || '')}"]`); if (on) on.scrollIntoView({ inline: 'center', block: 'nearest' }); });
+}
+function renderQuickRows() {
+  S.parts.forEach((p, i) => p._i = i);
+  const idx = Object.keys(S.counts).map(Number).sort((a, b) => String(S.counts[b].at).localeCompare(String(S.counts[a].at)));
+  $('binsList').innerHTML = idx.length ? `<div class="bin"><div class="binhead"><span class="tag">Counted in this quick count</span><span class="cnt num">${idx.length}</span></div>
+    <div class="rows">${idx.map(i => rowHTML(S.parts[i])).join('')}</div></div>`
+    : `<div class="callout">Quick count: say or type a part and count, for example <b>AB1769-IF8 4</b>. Only the parts you count are saved, at the location shown above. Nothing else in the warehouse changes.</div>`;
+}
 function rowHTML(p) {
   const c = S.counts[p._i];
   const cls = c == null ? '' : (c.qty === 0 ? 'zero' : 'counted');
   const notes = c && (c.notes.length || c.manualNote) ? `<div class="notes">${esc([...c.notes, c.manualNote].filter(Boolean).join(' · '))}</div>` : '';
   return `<div class="row ${cls}" id="row-${p._i}" data-i="${p._i}"><div class="stripe"></div>
-    <div class="info"><div class="pn">${esc(p.id)}</div><div class="desc">${esc(p.desc)}</div>${notes}</div>
+    <div class="info"><div class="pn">${esc(p.id)}</div><div class="desc">${esc(p.desc)}</div>${isQuick() && c ? `<div class="desc">at <b>${esc(c.loc || '')}</b>${p.loc && c.loc && p.loc.toUpperCase() !== String(c.loc).toUpperCase() ? ` · system: ${esc(p.loc)}` : ''}</div>` : ''}${notes}</div>
     <div class="stepper"><button data-act="dec" aria-label="Minus one">−</button><div class="val num ${c == null ? 'empty' : ''}">${c == null ? '–' : c.qty}</div><button data-act="inc" aria-label="Plus one">+</button></div>
     <div class="rowtools" hidden><input type="text" placeholder="Note for this line" value="${esc(c ? (c.manualNote || '') : '')}" data-act="note"><button class="btn small" data-act="zero">Not found</button><button class="btn small ghost" data-act="clear">Clear</button></div>
   </div>`;
@@ -440,11 +483,13 @@ function applyCount(i, qty, opts = {}) {
   if (opts.raw) c.heard.push(opts.raw);
   if (opts.countedAs) addNote(c, `Counted as ${opts.countedAs}`);
   if (opts.byDesc) addNote(c, 'Matched by description');
-  if (opts.bin && p.bin && opts.bin !== p.bin) addNote(c, `Found on shelf ${opts.bin}, system shows ${p.bin} - relocate/update bin`);
-  if (opts.bin && !p.bin && hasShelves()) addNote(c, `Found on shelf ${opts.bin}, no bin in system - assign bin`);
+  if (!isQuick() && opts.bin && p.bin && opts.bin !== p.bin) addNote(c, `Found on shelf ${opts.bin}, system shows ${p.bin} - relocate/update bin`);
+  if (!isQuick() && opts.bin && !p.bin && hasShelves()) addNote(c, `Found on shelf ${opts.bin}, no bin in system - assign bin`);
   if (qty === 0 && opts.notFound) addNote(c, 'Not found in count - verify');
   c.at = new Date().toISOString();
-  if (opts.bin) c.foundBin = opts.bin; else if (!c.foundBin) c.foundBin = S.bin || p.bin || '';
+  if (opts.bin) c.foundBin = opts.bin; else if (!c.foundBin) c.foundBin = S.bin || (isQuick() ? '' : p.bin) || '';
+  if (isQuick()) { if (!c.loc || opts.mode !== 'set' || opts.raw) { c.loc = foundAt(opts.bin || S.bin, S.rack); c.rack = S.rack; } }
+  else c.loc = foundAt(c.foundBin || p.bin);
   if (opts.status || !c.status) c.status = opts.status || 'manual';
   if (opts.conf != null) c.conf = opts.conf;
   markLine('r:' + i);
@@ -475,7 +520,7 @@ function undo() {
   if (u.type === 'count') { if (u.prev) S.counts[u.i] = u.prev; else delete S.counts[u.i]; S.log.length = u.logLen; markLine('r:' + u.i); }
   if (u.type === 'strays') { const before = S.strays; S.strays = u.prev; S.log.length = u.logLen; markStrays(before); }
   if (u.type === 'pending') S.pending = S.pending.filter(p => p.id !== u.id);
-  if (u.type === 'bin') S.bin = u.prev;
+  if (u.type === 'bin') { S.bin = u.prev; if (u.prevRack !== undefined) S.rack = u.prevRack; }
   save(); renderAll(); hideToast(); updatePreview();
 }
 
@@ -492,6 +537,7 @@ function commitOne(raw) {
   const r = Matcher.parse(raw, index, { bin: S.bin });
   if (!r) return null;
   if (r.kind === 'location') {
+    if (isQuick() && r.rack) { undoStack.push({ type: 'bin', prev: S.bin, prevRack: S.rack }); S.rack = r.rack; S.bin = r.bin || null; save(); renderHeader(); speak(`${r.rack}${r.bin ? ' shelf ' + r.bin : ''}`); return `Now counting at ${foundAt(S.bin, S.rack)}`; }
     if (r.rack && r.rack !== S.rack && !r.bin) return `Rack ${r.rack} isn't the one being counted. This count is ${S.rack}.`;
     if (r.bin) { undoStack.push({ type: 'bin', prev: S.bin }); S.bin = r.bin; save(); speak(`Shelf ${r.bin}`); scrollToBin(r.bin); return `Now on shelf ${r.bin}`; }
     return null;
@@ -553,7 +599,11 @@ function submitBox() {
 }
 
 /* header + rows events */
-$('hBins').addEventListener('click', e => { const b = e.target.closest('.binchip'); if (!b) return; undoStack.push({ type: 'bin', prev: S.bin }); S.bin = b.dataset.b; save(); renderHeader(); scrollToBin(S.bin); updatePreview(); });
+$('hBins').addEventListener('click', e => {
+  const qr = e.target.closest('[data-qr]');
+  if (qr) { let r = qr.dataset.qr; if (r === '?') { r = (prompt('Location (rack or area), for example CI8 or BENCH 2') || '').trim().toUpperCase(); if (!r) return; }
+    undoStack.push({ type: 'bin', prev: S.bin, prevRack: S.rack }); S.rack = r; S.bin = null; save(); renderHeader(); updatePreview(); return; }
+  const b = e.target.closest('.binchip'); if (!b) return; undoStack.push({ type: 'bin', prev: S.bin }); S.bin = b.dataset.b; save(); renderHeader(); scrollToBin(S.bin); updatePreview(); });
 $('binsList').addEventListener('click', e => {
   const srow = e.target.closest('[data-sid]');
   if (srow) { const st = S.strays.find(x => x.id === srow.dataset.sid); const a = e.target.closest('[data-sact]')?.dataset.sact; if (!st || !a) return;
@@ -620,7 +670,7 @@ function openUnlisted(pre = {}, fromPending = null, editId = null) {
   if (u) $('uDel').onclick = () => { S.unlisted = S.unlisted.filter(x => x !== u); markLine('u:' + u.id, { gone: true, u: { ...u, photo: null } }); save(); $('sheet').hidden = true; renderAll(); };
   $('uSave').onclick = () => {
     const rec = { id: u ? u.id : 'u' + (S.seq++), pn: $('uPn').value.trim(), desc: $('uDesc').value.trim(), qty: +$('uQty').value || 0, bin: $('uBin').value.trim().toUpperCase(), notes: $('uNotes').value.trim(), photo };
-    rec.at = new Date().toISOString();
+    rec.at = new Date().toISOString(); rec.loc = foundAt(rec.bin || (isQuick() ? S.bin : ''), S.rack);
     if (u) Object.assign(u, rec); else S.unlisted.push(rec);
     markLine('u:' + rec.id);
     if (fromPending) S.pending = S.pending.filter(p => p.id !== fromPending);
@@ -643,7 +693,22 @@ function hideToast() { $('toast').hidden = true; }
 $('toastUndo').addEventListener('click', undo);
 
 /* ---------------- review: counter (blind) + manager ---------------- */
-$('toReview').addEventListener('click', () => { managerOpen = false; showReview(); });
+$('toReview').addEventListener('click', async () => {
+  if (isQuick()) { // nothing to zero: everything counted is already saved; just close it on this phone
+    if (S.pending.length && !confirm(`${S.pending.length} card${S.pending.length > 1 ? 's' : ''} still need a tap and won't be saved. Close anyway?`)) return;
+    S.sessionDirty = true; queueDirty(); await flushSync();
+    const n = Object.keys(S.counts).length + S.unlisted.length, left = waitingCount();
+    store.del(KEY); S = null; renderSetup(); window.scrollTo(0, 0);
+    $('fileMsg').textContent = `Quick count closed: ${n} line${n === 1 ? '' : 's'} saved${left ? `, ${left} waiting for signal` : ''}. Nothing else was changed.`;
+    renderPast(true); return;
+  }
+  managerOpen = false; showReview();
+});
+$('pauseBtn').addEventListener('click', async () => {
+  queueDirty(); await flushSync();
+  const rack = S.rack; store.set(KEY, S); S = null; renderSetup(); window.scrollTo(0, 0);
+  $('fileMsg').textContent = `${rack} paused. Nothing was set to 0. Tap Resume to keep going (or Continue under Counts in this warehouse).`;
+});
 function computeRows() {
   return S.parts.map((p, i) => {
     const c = S.counts[i]; const counted = c ? c.qty : 0;
@@ -680,7 +745,7 @@ function showReview() {
   $('csvBtn').onclick = () => saveFile(`${S.rack}_Count_${dateTag()}.csv`, buildCsv());
   if ($('photoBtn')) $('photoBtn').onclick = savePhotos;
   $('newBtn').onclick = () => {
-    $('newBtn').outerHTML = `<span class="callout" style="width:100%">Finishing sends every line to the server, with anything not counted saved as 0, "not found". <button class="btn small primary" id="newYes">Finish ${esc(S.rack)}</button></span>`;
+    $('newBtn').outerHTML = `<span class="callout" style="width:100%;background:var(--bad-bg)">${unc.length ? `<b>${unc.length} part${unc.length > 1 ? 's' : ''} you didn't count will be saved as 0 "not found".</b> Only finish if you counted the whole rack. To stop for now, go back and tap Pause. To count just a few parts, use Quick count.` : 'Every part on this rack has a count.'} <button class="btn small primary" id="newYes">Finish ${esc(S.rack)}${unc.length ? ` and set ${unc.length} to 0` : ''}</button></span>`;
     $('newYes').onclick = async () => {
       $('newYes').disabled = true; $('newYes').textContent = 'Saving…';
       S.finishedAt = new Date().toISOString(); S.sessionDirty = true;

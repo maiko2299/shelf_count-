@@ -10,6 +10,7 @@ function reconcile(input) {
   const money = (n) => Math.round((+n || 0) * 100) / 100;
   const day = (d) => String(d || '').slice(0, 10);
   const binOf = (loc) => String(loc || '').trim();
+  const normLoc = (loc) => String(loc || '').trim().toUpperCase().replace(/\//g, '\\').replace(/^\\+/, '');
   const rackOf = (loc) => (binOf(loc).split(/[\\/]/).filter(Boolean)[0] || '').toUpperCase();
 
   // ---- current ManagerPlus stock: by part, by warehouse ----
@@ -47,11 +48,24 @@ function reconcile(input) {
     return { qty, ev };
   }
 
-  // ---- keep only the newest count of each area (a recount replaces the old one) ----
-  const latest = new Map();
-  for (const s of sessions) { const k = `${s.warehouse_key}|${String(s.area).toUpperCase()}`; const cur = latest.get(k); if (!cur || s.started_at > cur.started_at) latest.set(k, s); }
-  const live = new Set([...latest.values()].map((s) => s.session_id));
-  const counted = lines.filter((l) => live.has(l.session_id) && l.qty_counted != null && !/^(cleared|removed|deleted)$/.test(l.match_status || ''));
+  // ---- which counts count ----
+  // Full rack counts: the newest finished count of each rack replaces older ones.
+  // Quick counts (source "quick") never replace a rack; they only add or update the lines they counted.
+  const latest = new Map(); const quickIds = new Set();
+  for (const s of sessions) {
+    if (s.source === 'quick') { quickIds.add(s.session_id); continue; }
+    const k = `${s.warehouse_key}|${String(s.area).toUpperCase()}`; const cur = latest.get(k); if (!cur || s.started_at > cur.started_at) latest.set(k, s);
+  }
+  const live = new Set([...latest.values()].map((s) => s.session_id).concat([...quickIds]));
+  const usable = lines.filter((l) => live.has(l.session_id) && l.qty_counted != null && !/^(cleared|removed|deleted)$/.test(l.match_status || ''));
+  // Newest count wins for each part at each location; lines from the same count at the same spot add up.
+  const spot = new Map();
+  for (const l of usable) {
+    const k = `${l.warehouse_key}|${l.part_key != null ? l.part_key : norm(l.part_id)}|${normLoc(l.found_bin) || normLoc(l.system_bin)}`;
+    const cur = spot.get(k);
+    if (!cur || String(l.counted_at) > cur.at) spot.set(k, { at: String(l.counted_at), sid: l.session_id });
+  }
+  const counted = usable.filter((l) => { const k = `${l.warehouse_key}|${l.part_key != null ? l.part_key : norm(l.part_id)}|${normLoc(l.found_bin) || normLoc(l.system_bin)}`; return spot.get(k).sid === l.session_id; });
   const countedAreas = new Map(); // wk -> Set(area)
   for (const s of latest.values()) { if (!countedAreas.has(s.warehouse_key)) countedAreas.set(s.warehouse_key, new Set()); countedAreas.get(s.warehouse_key).add(String(s.area).toUpperCase()); }
 
@@ -104,9 +118,9 @@ function reconcile(input) {
     const sysAtCount = L.map((l) => l.system_on_hand).find((v) => v != null);
     const countedQty = L.reduce((n, l) => n + (+l.qty_counted || 0), 0);
     const countedAt = L.map((l) => l.counted_at).sort().pop();
-    const firstAt = L.map((l) => l.counted_at).sort()[0];
+    const firstAt = L.some((l) => quickIds.has(l.session_id)) ? L.map((l) => l.counted_at).sort().pop() : L.map((l) => l.counted_at).sort()[0];
     const cost = +((g.sysRow && g.sysRow.cost) || L.find((l) => l.unit_cost)?.unit_cost || 0);
-    const sysBin = binOf((g.sysRow && g.sysRow.loc) || L.find((l) => l.system_bin)?.system_bin || '');
+    const sysBin = binOf((g.sysRow && g.sysRow.loc) || L.find((l) => l.system_bin)?.system_bin || '').replace(/^.*\(no bin\)$/i, '');
     const wn = whName(g.wk);
 
     // part-number mix-ups
@@ -117,16 +131,17 @@ function reconcile(input) {
     const foundBins = {}; for (const l of L) if (+l.qty_counted > 0) { const b = binOf(l.found_bin) || wn; foundBins[b] = (foundBins[b] || 0) + +l.qty_counted; }
     const fb = Object.keys(foundBins);
     const noteMove = L.map((l) => (String(l.notes || '').match(/found on (?:shelf )?([A-Z0-9\\]+)\s*\((?:system:?\s*)?([A-Z0-9\\]+)\)/i))).find(Boolean);
-    if (!sysBin && fb.length && fb.some((b) => /\\/.test(b))) {
-      push({ action_id: `assign|${g.wk}|${g.partKey}`, type: 'assign_bin', part_id: pid, part_key: g.partKey, description: desc, warehouse_key: g.wk, warehouse_name: wn, from_loc: '(no bin)', to_loc: fb.filter((b) => /\\/.test(b)).join(', '), qty: countedQty, value: money(countedQty * cost), counted_at: countedAt,
+    const realSpot = (b) => normLoc(b) && normLoc(b) !== normLoc(wn);
+    if (!sysBin && fb.length && fb.some(realSpot)) {
+      push({ action_id: `assign|${g.wk}|${g.partKey}`, type: 'assign_bin', part_id: pid, part_key: g.partKey, description: desc, warehouse_key: g.wk, warehouse_name: wn, from_loc: '(no bin)', to_loc: fb.filter(realSpot).join(', '), qty: countedQty, value: money(countedQty * cost), counted_at: countedAt,
         summary: `No bin in ManagerPlus. Found on ${fb.join(', ')}. Assign the bin.`, detail: JSON.stringify({ foundBins }) });
-    } else if (sysBin && fb.length && !fb.some((b) => b.toUpperCase() === sysBin.toUpperCase())) {
+    } else if (sysBin && fb.length && !fb.some((b) => normLoc(b) === normLoc(sysBin))) {
       const to = fb.sort((a, b) => foundBins[b] - foundBins[a])[0];
       push({ action_id: `move|${g.wk}|${g.partKey}`, type: 'bin_move', part_id: pid, part_key: g.partKey, description: desc, warehouse_key: g.wk, warehouse_name: wn, from_loc: sysBin, to_loc: to, qty: countedQty, value: money(countedQty * cost), counted_at: countedAt,
         summary: `ManagerPlus says ${sysBin}; found on ${fb.map((b) => `${b} ×${foundBins[b]}`).join(', ')}. Move it back or update the bin.`, detail: JSON.stringify({ foundBins }) });
     } else if (noteMove && sysBin) {
       const to = /\\/.test(noteMove[1]) ? noteMove[1] : `\\${rackOf(sysBin)}\\${noteMove[1].toUpperCase()}`;
-      if (to.toUpperCase() !== sysBin.toUpperCase()) push({ action_id: `move|${g.wk}|${g.partKey}`, type: 'bin_move', part_id: pid, part_key: g.partKey, description: desc, warehouse_key: g.wk, warehouse_name: wn, from_loc: sysBin, to_loc: to, qty: countedQty, value: money(countedQty * cost), counted_at: countedAt,
+      if (normLoc(to) !== normLoc(sysBin)) push({ action_id: `move|${g.wk}|${g.partKey}`, type: 'bin_move', part_id: pid, part_key: g.partKey, description: desc, warehouse_key: g.wk, warehouse_name: wn, from_loc: sysBin, to_loc: to, qty: countedQty, value: money(countedQty * cost), counted_at: countedAt,
         summary: `Count note says found on ${to}; ManagerPlus says ${sysBin}.`, detail: JSON.stringify({ note: noteMove[0] }) });
     }
 
@@ -143,7 +158,8 @@ function reconcile(input) {
     let adjust = target - current;
     let late = false;
     if (adjust !== 0 && used.qty > 0 && current === countedQty && adjust === -used.qty) { late = true; adjust = 0; }
-    net.push({ g, pid, desc, cost, wn, countedAt, firstAt, variance, varAdj: adjust, used, recv, current, target, sysAtCount, countedQty, sysBin, late });
+    const where = fb.length > 1 ? ` Found: ${fb.map((b) => `${b} \u00d7${foundBins[b]}`).join(', ')}.` : '';
+    net.push({ g, pid, desc, cost, wn, countedAt, firstAt, variance, varAdj: adjust, used, recv, current, target, sysAtCount, countedQty, sysBin, late, where });
   }
 
   // ---- transfers: extra in one warehouse, short in another ----
@@ -172,12 +188,12 @@ function reconcile(input) {
         summary: `Counted ${n.countedQty} vs ${n.sysAtCount} in system; the work order entered after the count already brought ManagerPlus to ${n.current}. Nothing to adjust.`, detail: JSON.stringify({ evidence: ev }) }); continue; }
     if (n.varAdj === 0) continue;
     if (n.varAdj < 0) {
-      const elsewhere = (inv.get(norm(n.pid)) || []).filter((r) => r.onHand > 0 && !(r.wk === g.wk && r.loc.toUpperCase() === n.sysBin.toUpperCase()) && !(countedAreas.get(r.wk) || new Set()).has(rackOf(r.loc) || whName(r.wk).toUpperCase()));
+      const elsewhere = (inv.get(norm(n.pid)) || []).filter((r) => r.onHand > 0 && !(r.wk === g.wk && normLoc(r.loc) === normLoc(n.sysBin)) && !(countedAreas.get(r.wk) || new Set()).has(rackOf(r.loc) || whName(r.wk).toUpperCase()));
       if (elsewhere.length) push({ action_id: `look|${g.wk}|${g.partKey}`, type: 'check_elsewhere', part_id: n.pid, part_key: g.partKey, description: n.desc, warehouse_key: g.wk, warehouse_name: n.wn, from_loc: elsewhere.map((r) => `${whName(r.wk)} ${r.loc} ×${r.onHand}`.trim()).join('; '), to_loc: `${n.wn} ${n.sysBin}`.trim(), qty: -n.varAdj, value: money(-n.varAdj * n.cost), counted_at: n.countedAt,
         summary: `${-n.varAdj} short at ${n.wn}. ManagerPlus shows stock at ${elsewhere.map((r) => `${whName(r.wk)} ${r.loc}`.trim()).join(', ')}, which hasn't been counted yet. Look there before adjusting.`, detail: JSON.stringify({ evidence: ev }) });
     }
     push({ action_id: `adjust|${g.wk}|${g.partKey}`, type: 'adjust_qty', part_id: n.pid, part_key: g.partKey, description: n.desc, warehouse_key: g.wk, warehouse_name: n.wn, from_loc: String(n.current), to_loc: String(n.current + n.varAdj), qty: n.varAdj, value: money(n.varAdj * n.cost), counted_at: n.countedAt,
-      summary: `Counted ${n.countedQty} on ${day(n.countedAt)} (system then ${n.sysAtCount})${n.used.qty ? `, ${n.used.qty} used since` : ''}${n.recv.qty ? `, ${n.recv.qty} received since` : ''}. ManagerPlus now ${n.current}; should be ${n.current + n.varAdj}. Adjust ${n.varAdj > 0 ? '+' : ''}${n.varAdj}.${n.used.qty ? ' If a work order below was pulled before the count date, leave it out.' : ''}`,
+      summary: `Counted ${n.countedQty} on ${day(n.countedAt)} (system then ${n.sysAtCount})${n.used.qty ? `, ${n.used.qty} used since` : ''}${n.recv.qty ? `, ${n.recv.qty} received since` : ''}. ManagerPlus now ${n.current}; should be ${n.current + n.varAdj}. Adjust ${n.varAdj > 0 ? '+' : ''}${n.varAdj}.${n.where || ''}${n.used.qty ? ' If a work order below was pulled before the count date, leave it out.' : ''}`,
       detail: JSON.stringify({ evidence: ev, counted: n.countedQty, systemAtCount: n.sysAtCount, usedSince: n.used.qty, receivedSince: n.recv.qty, currentOnHand: n.current }) });
   }
 

@@ -18,9 +18,11 @@ It's a static site with no build step. Vercel serves it as-is (Framework preset:
 
 1. Sign in with your name and PIN (same people and PINs as the Parts Receiving app).
 2. Pick a warehouse and tap **Load from ManagerPlus**. The app pulls that warehouse's parts, bins and on-hand live through n8n. Uploading a ManagerPlus .xlsx export still works as a fallback.
-3. Pick a rack and count. Yellow cards need one tap; red cards are parts that aren't on that rack, and the app shows where the system thinks they are.
-4. Every line saves to the server a few seconds after you count it, with the time it was counted. With no signal, lines wait on the phone and upload when signal returns (the badge in the header shows how many are waiting).
-5. **Finish this count** sends every line, with anything not counted saved as 0 "not found", and marks the count finished.
+3. Pick a rack, then either:
+   - **Start counting**: a full rack count. When you finish, every part on that rack you didn't count is saved as 0 "not found" (the app lists them and asks first).
+   - **Quick count**: count only what's in front of you, anywhere in the warehouse. Pick the rack chip (or say "rack CI8 shelf D"), then part and count. Nothing else is touched, and nothing is ever set to 0. Use it for a box you just found, a part that came back, or checking a variance.
+4. Every line saves to the server a few seconds after you count it, with the time it was counted. With no signal, lines wait on the phone and upload when signal returns (the header badge shows how many are waiting).
+5. **Pause** saves and goes back to the start screen without finishing. Resume it on this phone, or Continue it from "Counts in this warehouse" on any phone. **Review** shows what's counted; **Finish** is only there.
 6. Managers see the variance view; counters never see system quantities. Saving the Excel/CSV files still works.
 
 ## Back end
@@ -39,7 +41,7 @@ People, PINs and the warehouse list live in the workflow's **Gatekeeper** node (
 
 **Open reconcile board** on the start screen (managers only). **Run reconcile now** makes n8n:
 
-1. take the newest count of every rack/area in every warehouse,
+1. take the newest finished full count of every rack/area, plus every quick count. For each part at each location the newest count wins, so a quick count only changes the lines it counted,
 2. pull current ManagerPlus stock for all warehouses, the work-order parts used on counted parts, the work orders since the first count (for dates), and recent POs,
 3. sort every difference into one action:
 

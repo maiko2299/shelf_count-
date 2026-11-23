@@ -38,7 +38,7 @@ button { cursor: pointer; }
 .top { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 20; background: var(--surface); border-bottom: 1px solid var(--line); }
 .top .wrap { padding-block: 10px 8px; display: grid; gap: 8px; }
 .toprow { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.shelfname { font-family: var(--f-display); font-weight: 700; font-size: 28px; line-height: 1; letter-spacing: 0.01em; }
+.shelfname { font-family: var(--f-display); font-weight: 700; font-size: 28px; line-height: 1; letter-spacing: 0.01em; white-space: nowrap; }
 .shelfmeta { color: var(--muted); font-size: 12.5px; line-height: 1.25; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .spacer { flex: 1; }
 .btn { border: 1px solid var(--line); background: var(--surface); border-radius: 8px; padding: 8px 12px; font-weight: 600; font-size: 14px; display: inline-flex; align-items: center; gap: 6px; }
@@ -210,7 +210,8 @@ tr.over td.v { color: var(--ok); font-weight: 600; } tr.under td.v { color: var(
       <div class="spacer"></div>
       <span class="sync" id="hSync" hidden></span>
       <button class="btn small ghost themeBtn" aria-label="Change theme"></button>
-      <button class="btn small" id="toReview">Finish</button>
+      <button class="btn small ghost" id="pauseBtn">Pause</button>
+      <button class="btn small" id="toReview">Review</button>
     </div>
     <div class="progress" aria-hidden="true"><i id="hBar"></i></div>
     <div class="bins" id="hBins" role="toolbar" aria-label="Current bin"></div>
@@ -252,7 +253,8 @@ tr.over td.v { color: var(--ok); font-weight: 600; } tr.under td.v { color: var(
           <label>Rack to count</label>
           <div class="rackgrid" id="rackGrid"></div>
         </div>
-        <div class="prow"><button class="btn primary" id="startBtn">Start counting</button><button class="btn" id="resumeBtn" hidden>Resume</button></div>
+        <div class="prow"><button class="btn primary" id="startBtn">Start counting</button><button class="btn" id="quickBtn">Quick count</button><button class="btn" id="resumeBtn" hidden>Resume</button></div>
+        <p class="empty-note" style="margin:0"><b>Start counting</b> = the whole rack (anything not counted is 0 when you finish). <b>Quick count</b> = only what you count, anywhere in this warehouse; nothing else changes.</p>
       </div>
       <div class="panel" id="pastPanel" hidden>
         <div class="prow" style="justify-content:space-between"><h2>Counts in this warehouse</h2><button class="btn small ghost" id="pastRefresh">Refresh</button></div>
@@ -330,6 +332,6 @@ tr.over td.v { color: var(--ok); font-weight: 600; } tr.under td.v { color: var(
 <div class="toast" id="toast" hidden><span id="toastTxt"></span><button id="toastUndo">Undo</button></div>
 <div class="sheet" id="sheet" hidden><div class="wrap"><div class="panel" id="sheetPanel"></div></div></div>
 
-<script src="matcher.js?v=3"></script>
-<script src="app.js?v=4"></script>
+<script src="matcher.js?v=5"></script>
+<script src="app.js?v=6"></script>
 </body></html>
